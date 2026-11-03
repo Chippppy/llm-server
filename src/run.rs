@@ -93,12 +93,15 @@ pub fn setups_dir() -> PathBuf {
 fn validate_setup_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || name.starts_with('.')
+        || name.starts_with('-')
         || name.contains('/')
         || name.contains('\\')
         || name.contains("..")
+        || name.contains('@')
     {
         return Err(format!(
-            "Invalid setup name '{}': must be a simple file stem (no slashes, no leading dot)",
+            "Invalid setup name '{}': must be a simple file stem \
+             (no slashes, no leading dot or dash, no '@')",
             name
         ));
     }
@@ -604,6 +607,8 @@ spec_draft_n_max = 5
         assert!(validate_setup_name("a/b").is_err());
         assert!(validate_setup_name(".hidden").is_err());
         assert!(validate_setup_name("muse.template").is_err());
+        assert!(validate_setup_name("-flag").is_err());
+        assert!(validate_setup_name("a@b").is_err());
     }
 
     #[test]

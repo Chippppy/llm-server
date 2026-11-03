@@ -180,6 +180,16 @@ Writes `waybar/llm-server-module.json` to `~/.config/waybar/modules/llm-server-m
 
 Stops running `llm-server@*.service` instances, removes the template unit, `/usr/local/bin/llm-server-ctl`, the sudoers file, and `~/.config/llm-server-indicator` (plus the v1 autostart desktop entry if present). The Waybar integration and any legacy v1 unit are left in place on purpose.
 
+## Security notes
+
+Read these before installing on a shared or networked machine:
+
+- **Your config directory is code.** `setups/<name>.toml`'s `binary` field is `exec()`-ed by systemd. Anyone who can write `~/.config/llm-server-indicator/` can get code execution as your user. Keep the directory private (the installer writes `config.toml` and the setup templates with mode `600`), and don't pull that directory from untrusted dotfiles repos.
+- **The sudoers grant is a wildcard, on purpose.** The NOPASSWD entry covers every `llm-server@*.service` instance — that's what lets a new setup start without a new unit file or sudoers edit. It is scoped to five `systemctl` verbs (`start`/`stop`/`restart`/`status`/`is-active`) and the installing user only, and instances run as that user (`NoNewPrivileges=true`). If you don't need passwordless control, delete `/etc/sudoers.d/llm-server-$USER`.
+- **`llama-server` has no authentication.** The default bind is `127.0.0.1`, which is still reachable by *every local user* on a multi-user box. Keep `host` on loopback there; if you ever expose the server beyond loopback (e.g. via `extra_args`), protect it yourself (API key, firewall) — the schema's `host` field and `extra_args` both influence the bind, and `extra_args` is an unvalidated escape hatch.
+- **`install.sh` runs with full sudo.** Treat any fork of this repository as root-equivalent: clone only from the trusted source, and review the script before running it.
+- Health checks (`health_url`) make plain outbound HTTP requests with no auth; point them at your own servers.
+
 ## Migrating from v1
 
 Existing users of the legacy single-server unit: after running `scripts/install.sh`, run `./scripts/migrate_from_v1.sh` (preview with `--dry-run`). It backs up `/etc/systemd/system/llm-server.service`, stops and disables it, removes the unit file, and reloads systemd. It is idempotent and never enables or starts any v2 unit.

@@ -4,7 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_DIR="$HOME/.config/llm-server-indicator"
 SETUPS_DIR="$CONFIG_DIR/setups"
-SUDOERS_FILE="/etc/sudoers.d/llm-server-$USER"
+# whoami, not $USER (the env var is spoofable and could inject path separators
+# into the sudoers file name)
+INSTALL_USER="$(whoami)"
+SUDOERS_FILE="/etc/sudoers.d/llm-server-$INSTALL_USER"
 TEMPLATE_UNIT_SRC="$SCRIPT_DIR/systemd/llm-server@.service"
 TEMPLATE_UNIT_DEST="/etc/systemd/system/llm-server@.service"
 LEGACY_UNIT="/etc/systemd/system/llm-server.service"
@@ -29,8 +32,8 @@ run_cmd() {
 
 echo "Installing llm-server-indicator (v2)"
 
-# Install binaries via cargo
-run_cmd cargo install --path "$SCRIPT_DIR"
+# Install binaries via cargo (--locked: reproducible build from Cargo.lock)
+run_cmd cargo install --path "$SCRIPT_DIR" --locked
 
 # Install both binaries to /usr/local/bin (the template unit's ExecStart and
 # the Waybar on-click commands call them by absolute path)
@@ -50,9 +53,8 @@ for bin in llm-server-ctl llm-server-indicator; do
 done
 
 # Create sudoers file with NOPASSWD for the legacy unit and template instances
-SUDOERS_USER="$(whoami)"
 SYSTEMCTL_PATH="$(command -v systemctl)"
-SUDOERS_CONTENT="$SUDOERS_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_PATH start llm-server.service, $SYSTEMCTL_PATH stop llm-server.service, $SYSTEMCTL_PATH restart llm-server.service, $SYSTEMCTL_PATH status llm-server.service, $SYSTEMCTL_PATH is-active llm-server.service, $SYSTEMCTL_PATH start llm-server@*.service, $SYSTEMCTL_PATH stop llm-server@*.service, $SYSTEMCTL_PATH restart llm-server@*.service, $SYSTEMCTL_PATH status llm-server@*.service, $SYSTEMCTL_PATH is-active llm-server@*.service"
+SUDOERS_CONTENT="$INSTALL_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_PATH start llm-server.service, $SYSTEMCTL_PATH stop llm-server.service, $SYSTEMCTL_PATH restart llm-server.service, $SYSTEMCTL_PATH status llm-server.service, $SYSTEMCTL_PATH is-active llm-server.service, $SYSTEMCTL_PATH start llm-server@*.service, $SYSTEMCTL_PATH stop llm-server@*.service, $SYSTEMCTL_PATH restart llm-server@*.service, $SYSTEMCTL_PATH status llm-server@*.service, $SYSTEMCTL_PATH is-active llm-server@*.service"
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[DRY-RUN] Would write sudoers file to $SUDOERS_FILE"
   echo "[DRY-RUN] Content: $SUDOERS_CONTENT"
@@ -110,9 +112,9 @@ for setup_file in "$SCRIPT_DIR"/setups/*.template.toml; do
     continue
   fi
   if [[ $DRY_RUN -eq 1 ]]; then
-    echo "[DRY-RUN] Would copy $setup_file to $setup_dest"
+    echo "[DRY-RUN] Would copy $setup_file to $setup_dest (mode 600)"
   else
-    cp "$setup_file" "$setup_dest"
+    install -m 600 "$setup_file" "$setup_dest"
     echo "Installed setup template $setup_dest (fill in the real paths before use)"
   fi
 done
@@ -122,10 +124,9 @@ if [[ -f "$CONFIG_DIR/config.toml" ]]; then
   echo "Note: $CONFIG_DIR/config.toml already exists - leaving it untouched."
   echo "Merge any entries you need from $SCRIPT_DIR/config/default.toml manually."
 elif [[ $DRY_RUN -eq 1 ]]; then
-  echo "[DRY-RUN] Would copy $SCRIPT_DIR/config/default.toml to $CONFIG_DIR/config.toml"
+  echo "[DRY-RUN] Would copy $SCRIPT_DIR/config/default.toml to $CONFIG_DIR/config.toml (mode 600)"
 else
-  cp "$SCRIPT_DIR/config/default.toml" "$CONFIG_DIR/config.toml"
-  chmod 644 "$CONFIG_DIR/config.toml"
+  install -m 600 "$SCRIPT_DIR/config/default.toml" "$CONFIG_DIR/config.toml"
   echo "Installed default config to $CONFIG_DIR/config.toml"
 fi
 
