@@ -1,0 +1,11 @@
+[services.muse]
+unit = "llm-server@muse.service"
+display_name = "Muse Glimmer 30B"
+health_url = "http://127.0.0.1:8080/health"
+group = "default"
+
+[services.qwen]
+unit = "llm-server@qwen.service"
+display_name = "Qwen 3.8 27B"
+health_url = "http://127.0.0.1:8080/health"
+group = "default"

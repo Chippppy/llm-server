@@ -1,0 +1,62 @@
+/* Waybar llm-server module styles */
+/* Matches the rest of the bar: Tokyo Night background, purple border,
+   orange hover. State colors use the same Tokyo Night palette. */
+
+#custom-llm-server,
+#custom-llm-muse,
+#custom-llm-qwen {
+  background: rgba(36, 39, 58, 0.9);
+  padding: 1px 6px;
+  margin: 3px;
+  border: 1.5px solid rgb(198, 160, 246);
+  border-radius: 4px;
+}
+
+#custom-llm-server:hover,
+#custom-llm-muse:hover,
+#custom-llm-qwen:hover {
+  background: rgba(98, 106, 157, 0.85);
+  border: 1.5px solid rgb(245, 201, 130);
+  transition: background-color 300ms linear;
+}
+
+/* State colors */
+
+#custom-llm-server.active,
+#custom-llm-muse.active,
+#custom-llm-qwen.active {
+  color: #9ece6a;
+}
+
+#custom-llm-server.inactive,
+#custom-llm-muse.inactive,
+#custom-llm-qwen.inactive {
+  color: #8087a2;
+}
+
+#custom-llm-server.unhealthy,
+#custom-llm-muse.unhealthy,
+#custom-llm-qwen.unhealthy,
+#custom-llm-server.failed,
+#custom-llm-muse.failed,
+#custom-llm-qwen.failed {
+  color: #f2747b;
+}
+
+#custom-llm-server.loading,
+#custom-llm-muse.loading,
+#custom-llm-qwen.loading,
+#custom-llm-server.activating,
+#custom-llm-muse.activating,
+#custom-llm-qwen.activating,
+#custom-llm-server.deactivating,
+#custom-llm-muse.deactivating,
+#custom-llm-qwen.deactivating {
+  color: #7aa2f7;
+}
+
+#custom-llm-server.unknown,
+#custom-llm-muse.unknown,
+#custom-llm-qwen.unknown {
+  color: #8087a2;
+}

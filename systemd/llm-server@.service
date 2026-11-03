@@ -1,0 +1,15 @@
+[Unit]
+Description=llama.cpp server: %i
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/llm-server-ctl run %i
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+User=__INSTALL_USER__
+
+[Install]
+WantedBy=multi-user.target

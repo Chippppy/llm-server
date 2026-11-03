@@ -1,0 +1,50 @@
+# Muse-Glimmer 30B setup template.
+#
+# This is a TEMPLATE, not a ready-to-run spec. Copy it to
+#   ~/.config/llm-server-indicator/setups/muse.toml
+# and replace the /path/to/... placeholders with your real paths.
+# Files named *.template.toml are ignored by `llm-server-ctl run`.
+#
+# The flag values below are the tuned defaults for Muse-Glimmer 30B.
+
+[server]
+# Path to the llama-server binary (required)
+binary = "/path/to/llama.cpp/build/bin/llama-server"
+# Host to bind (default: "127.0.0.1")
+host = "127.0.0.1"
+# Port (required; must not already be bound)
+port = 8080
+
+[model]
+# Main model file (required)
+main = "/path/to/models/muse-glimmer/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf"
+# Speculative-decoding draft model (optional — omit this line entirely when unused)
+draft = "/path/to/models/muse-glimmer/dflash-Muse-Glimmer-30B-Q4_K_M.gguf"
+# Speculation type (required when draft is set)
+spec_type = "draft-dflash"
+# Max speculative draft tokens (requires draft)
+spec_draft_n_max = 15
+
+[flags]
+# GPU layers for the main model (llama.cpp default: 0)
+ngl = 99
+# GPU layers for the draft model (llama.cpp default: 0)
+ngld = 99
+# Context size (llama.cpp default: 4096)
+ctx_size = 131072
+# Flash attention (llama.cpp default: off)
+flash_attention = true
+# Emit --jinja so the model's chat template handles message rendering (llama.cpp default: off)
+jinja = true
+# Sampling temperature (llama.cpp default: 0.8)
+temp = 1.0
+# Nucleus sampling (llama.cpp default: 0.95)
+top_p = 0.95
+# Top-k sampling (llama.cpp default: 40)
+top_k = 64
+# KV cache type for K (llama.cpp default: f16) — not tuned for this model
+#cache_type_k = "q8_0"
+# KV cache type for V (llama.cpp default: f16) — not tuned for this model
+#cache_type_v = "q8_0"
+# Extra arguments appended verbatim to the llama-server command line
+extra_args = []

@@ -1,0 +1,33 @@
+{
+  "group/llm": {
+    "orientation": "horizontal",
+    "drawer": {
+      "transition-duration": 250,
+      "transition-left-to-right": false,
+      "click-to-reveal": false
+    },
+    "modules": [
+      "custom/llm-server",
+      "custom/llm-muse",
+      "custom/llm-qwen"
+    ]
+  },
+  "custom/llm-muse": {
+    "format": "{}",
+    "return-type": "json",
+    "interval": 5,
+    "exec": "/usr/local/bin/llm-server-ctl status --service muse --json",
+    "tooltip": true,
+    "on-click": "/usr/local/bin/llm-server-ctl toggle --service muse",
+    "on-click-right": "/usr/local/bin/llm-server-ctl stop --service muse"
+  },
+  "custom/llm-qwen": {
+    "format": "{}",
+    "return-type": "json",
+    "interval": 5,
+    "exec": "/usr/local/bin/llm-server-ctl status --service qwen --json",
+    "tooltip": true,
+    "on-click": "/usr/local/bin/llm-server-ctl toggle --service qwen",
+    "on-click-right": "/usr/local/bin/llm-server-ctl stop --service qwen"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "custom/llm-server": {
+    "format": "{}",
+    "return-type": "json",
+    "interval": 5,
+    "exec": "/usr/local/bin/llm-server-ctl status --all --json",
+    "on-click": "/usr/local/bin/llm-server-indicator --gui"
+  }
+}

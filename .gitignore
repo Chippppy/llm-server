@@ -1,0 +1,9 @@
+/target
+# real per-user launch specs (machine-specific); templates ship in-repo
+setups/*
+!setups/*.template.toml
+# internal planning/testing artifacts
+PLAN.md
+PLAN_DETAILED.md
+PLAN_V2.md
+test_report.md
