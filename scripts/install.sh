@@ -7,7 +7,15 @@ SETUPS_DIR="$CONFIG_DIR/setups"
 # whoami, not $USER (the env var is spoofable and could inject path separators
 # into the sudoers file name)
 INSTALL_USER="$(whoami)"
-SUDOERS_FILE="/etc/sudoers.d/llm-server-$INSTALL_USER"
+# sudo only HONORS /etc/sudoers.d filenames matching [a-zA-Z0-9_-]+ and
+# silently IGNORES any other name (e.g. a username containing '.'). Sanitize
+# to that charset so a nonconforming username can't make the grant vanish
+# while the install "succeeds". uninstall.sh derives the same name.
+SUDOERS_NAME="$(printf 'llm-server-%s' "$INSTALL_USER" | tr -c 'a-zA-Z0-9_' '-')"
+if [[ "$SUDOERS_NAME" != "llm-server-$INSTALL_USER" ]]; then
+  echo "Warning: username '$INSTALL_USER' contains characters sudo ignores in sudoers.d filenames; using sanitized name '$SUDOERS_NAME'" >&2
+fi
+SUDOERS_FILE="/etc/sudoers.d/$SUDOERS_NAME"
 TEMPLATE_UNIT_SRC="$SCRIPT_DIR/systemd/llm-server@.service"
 TEMPLATE_UNIT_DEST="/etc/systemd/system/llm-server@.service"
 LEGACY_UNIT="/etc/systemd/system/llm-server.service"
@@ -15,12 +23,37 @@ LEGACY_UNIT="/etc/systemd/system/llm-server.service"
 DRY_RUN=${DRY_RUN:-0}
 export DRY_RUN
 
+# Validate INSTALL_WAYBAR up front: a non-numeric value would otherwise abort
+# under set -e mid-install, after privileged steps had already run.
+case "${INSTALL_WAYBAR:-}" in
+  '' | 0 | 1) ;;
+  *)
+    echo "Error: INSTALL_WAYBAR must be 0 or 1 (got '$INSTALL_WAYBAR')" >&2
+    exit 1
+    ;;
+esac
+
 # Pre-flight checks
 check_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: $1 is required but not found" >&2; exit 1; }; }
 check_cmd cargo
 check_cmd sudo
 check_cmd systemctl
 check_cmd visudo
+
+# The NOPASSWD grant below uses regex command arguments, which require
+# sudo >= 1.9.10 (older versions only understand plain wildcard arguments).
+# Parse the first line, e.g. "Sudo version 1.9.17p2".
+SUDO_VERSION="$(sudo --version | head -n1 | sed -n 's/^Sudo version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+if [[ -z "$SUDO_VERSION" ]]; then
+  echo "Error: could not parse sudo version (expected 'Sudo version X.Y.Z', got: $(sudo --version | head -n1))" >&2
+  exit 1
+fi
+# sort -C -V: exit 0 iff the pair (minimum, found) is version-sorted,
+# i.e. found >= minimum.
+if ! printf '%s\n%s\n' "1.9.10" "$SUDO_VERSION" | sort -C -V; then
+  echo "Error: sudo >= 1.9.10 is required (found $SUDO_VERSION): the sudoers grant uses anchored regex command arguments, which older sudo versions do not support." >&2
+  exit 1
+fi
 
 run_cmd() {
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -53,8 +86,36 @@ for bin in llm-server-ctl llm-server-indicator; do
 done
 
 # Create sudoers file with NOPASSWD for the legacy unit and template instances
+# (no `restart`: it is the persistence-enabler — a compromised user could keep
+# a malicious setup alive without a password; `stop` + `start` covers the need)
+#
+# sudoers command arguments are matched as ONE concatenated string, and `*`
+# matches whitespace: an unanchored `llm-server@*.service` would also match
+# "llm-server@x.service /tmp/evil.service", letting a local user run an
+# arbitrary unit as root. So each template-instance verb gets an anchored
+# extended-regex argument (sudo >= 1.9.10): the first argument starts with ^
+# and the pattern ends with $, so the whole user argv must match exactly —
+# one verb, one unit, no extra arguments. The unit-name charset mirrors
+# validate_setup_name (src/run.rs). The legacy llm-server.service entries
+# contain no wildcards, so plain exact strings are safe and stay as-is.
 SYSTEMCTL_PATH="$(command -v systemctl)"
-SUDOERS_CONTENT="$INSTALL_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_PATH start llm-server.service, $SYSTEMCTL_PATH stop llm-server.service, $SYSTEMCTL_PATH restart llm-server.service, $SYSTEMCTL_PATH status llm-server.service, $SYSTEMCTL_PATH is-active llm-server.service, $SYSTEMCTL_PATH start llm-server@*.service, $SYSTEMCTL_PATH stop llm-server@*.service, $SYSTEMCTL_PATH restart llm-server@*.service, $SYSTEMCTL_PATH status llm-server@*.service, $SYSTEMCTL_PATH is-active llm-server@*.service"
+case "$SYSTEMCTL_PATH" in
+  /usr/bin/* | /bin/*) ;;
+  *)
+    echo "Error: systemctl resolved to $SYSTEMCTL_PATH; refusing to bake a sudoers grant for a path outside /usr/bin or /bin" >&2
+    exit 1
+    ;;
+esac
+LEGACY_UNIT_GRANT="llm-server.service"
+TEMPLATE_UNIT_RE='llm-server@[A-Za-z0-9._-]+\.service'
+# The user-spec tag prefix is mandatory: without it the lines are not valid
+# sudoers (visudo -c rejects them), so the installer can never complete.
+SUDOERS_CONTENT="$INSTALL_USER ALL=(ALL) NOPASSWD: "
+for verb in start stop status is-active; do
+  SUDOERS_CONTENT+="$SYSTEMCTL_PATH $verb $LEGACY_UNIT_GRANT, "
+  SUDOERS_CONTENT+="$SYSTEMCTL_PATH ^$verb ${TEMPLATE_UNIT_RE}\$, "
+done
+SUDOERS_CONTENT="${SUDOERS_CONTENT%, }"
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[DRY-RUN] Would write sudoers file to $SUDOERS_FILE"
   echo "[DRY-RUN] Content: $SUDOERS_CONTENT"
@@ -87,7 +148,12 @@ else
     run_cmd sudo cp -p "$TEMPLATE_UNIT_DEST" "${TEMPLATE_UNIT_DEST}.bak.$(date +%s)"
   fi
   tmpunit=$(mktemp)
-  sed "s/__INSTALL_USER__/${TARGET_USER}/g" "$TEMPLATE_UNIT_SRC" > "$tmpunit"
+  # Escape sed replacement metacharacters in the username before interpolating
+  # it into the replacement string (defense in depth; whoami is normally safe).
+  escaped="${TARGET_USER//\\/\\\\}"
+  escaped="${escaped//&/\\&}"
+  escaped="${escaped//|/\\|}"
+  sed "s|__INSTALL_USER__|${escaped}|g" "$TEMPLATE_UNIT_SRC" > "$tmpunit"
   if grep -q "__INSTALL_USER__" "$tmpunit"; then
     rm -f "$tmpunit"
     echo "Error: __INSTALL_USER__ placeholder was not substituted" >&2
@@ -102,8 +168,14 @@ fi
 # Create config directory and install bundled setup templates.
 # Templates are starting points only: an existing destination file (from a
 # previous install or created by the user) is never backed up or overwritten.
-run_cmd mkdir -p "$CONFIG_DIR"
-run_cmd mkdir -p "$SETUPS_DIR"
+# Mode 700 on both dirs: the default umask (755) would let any local user
+# enumerate setup names under $SETUPS_DIR.
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "[DRY-RUN] Would create $CONFIG_DIR and $SETUPS_DIR (mode 700)"
+else
+  mkdir -p "$CONFIG_DIR" "$SETUPS_DIR"
+  chmod 700 "$CONFIG_DIR" "$SETUPS_DIR"
+fi
 for setup_file in "$SCRIPT_DIR"/setups/*.template.toml; do
   [[ -e "$setup_file" ]] || continue
   setup_dest="$SETUPS_DIR/$(basename "$setup_file")"
@@ -136,9 +208,8 @@ if [[ -f "$LEGACY_UNIT" ]]; then
   echo "Run scripts/migrate_from_v1.sh (user-run checkpoint) to back it up and remove it."
 fi
 
-# Optional Waybar integration
-INSTALL_WAYBAR=${INSTALL_WAYBAR:-}
-if [[ -z "$INSTALL_WAYBAR" ]]; then
+# Optional Waybar integration (INSTALL_WAYBAR validated up front; may be unset)
+if [[ -z "${INSTALL_WAYBAR:-}" ]]; then
   # Interactive prompt if running in a TTY
   if [[ -t 0 && $DRY_RUN -eq 0 ]]; then
     read -rp "Install Waybar integration? [y/N]: " answer

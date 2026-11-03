@@ -140,6 +140,28 @@ pub fn load_setup_from(dir: &Path, name: &str) -> Result<SetupSpec, String> {
     Ok(spec)
 }
 
+/// Pure: whether a server binary's ownership/mode is safe to execute.
+///
+/// Rejects binaries not owned by the effective user and binaries with group
+/// or other write bits: a local attacker who can write the file swaps it for
+/// their own and gains code execution on the next `start` or
+/// `Restart=on-failure` re-exec. Group/other read+execute is allowed.
+fn binary_ownership_ok(uid: u32, euid: u32, mode: u32) -> Result<(), String> {
+    if uid != euid {
+        return Err(format!(
+            "is owned by uid {} (effective user is {}): a local attacker could swap it and gain code execution on the next start or Restart re-exec — chown it to yourself",
+            uid, euid
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(
+            "is group- or other-writable: a local attacker could swap it and gain code execution on the next start or Restart re-exec — remove the group/other write bits"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Validate that a spec is runnable on this machine.
 pub fn validate_spec(spec: &SetupSpec) -> Result<(), String> {
     let bin = Path::new(&spec.server.binary);
@@ -148,14 +170,16 @@ pub fn validate_spec(spec: &SetupSpec) -> Result<(), String> {
     }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(bin)
-            .map_err(|e| format!("Failed to stat {}: {}", bin.display(), e))?
-            .permissions()
-            .mode();
+        let meta =
+            fs::metadata(bin).map_err(|e| format!("Failed to stat {}: {}", bin.display(), e))?;
+        let mode = meta.permissions().mode();
         if mode & 0o111 == 0 {
             return Err(format!("binary is not executable: {}", bin.display()));
         }
+        binary_ownership_ok(meta.uid(), unsafe { libc::geteuid() }, mode)
+            .map_err(|e| format!("binary {}: {}", bin.display(), e))?;
     }
     if !Path::new(&spec.model.main).is_file() {
         return Err(format!("main model not found: {}", spec.model.main));
@@ -174,8 +198,39 @@ pub fn validate_spec(spec: &SetupSpec) -> Result<(), String> {
     if spec.server.port == 0 {
         return Err("server.port must not be 0".into());
     }
+    // TOML accepts nan/inf; llama-server rejects them at startup, so catch
+    // them here with an actionable message instead of a restart loop.
+    for (name, value) in [
+        ("flags.temp", spec.flags.temp),
+        ("flags.top_p", spec.flags.top_p),
+    ] {
+        if value.is_some_and(|v| !v.is_finite()) {
+            return Err(format!("{} is not a finite number", name));
+        }
+    }
     if spec.server.host.trim().is_empty() {
         return Err("server.host must not be empty".into());
+    }
+    let host = spec.server.host.trim();
+    if !matches!(host, "127.0.0.1" | "::1" | "localhost") {
+        return Err(format!(
+            "server.host '{}' is not a loopback address (allowed: 127.0.0.1, ::1, localhost); llama-server has no authentication, so binding anywhere else exposes it to the network",
+            host
+        ));
+    }
+    // extra_args is appended after the [server] host/port flags, so a
+    // --host/--port in there would override the validated bind.
+    for arg in &spec.flags.extra_args {
+        if arg == "--host"
+            || arg.starts_with("--host=")
+            || arg == "--port"
+            || arg.starts_with("--port=")
+        {
+            return Err(format!(
+                "flags.extra_args contains '{}': the bind host/port may only be set via [server], and the host must be loopback",
+                arg
+            ));
+        }
     }
     Ok(())
 }
@@ -271,12 +326,9 @@ pub fn run_setup(name: &str) -> Result<(), String> {
         )
     })?;
     let argv = build_argv(&spec);
-    eprintln!(
-        "[run] setup='{}' exec {} {}",
-        name,
-        spec.server.binary,
-        argv.join(" ")
-    );
+    // Log only the setup name and binary path, not the full argv (model
+    // paths and extra_args are user data that would end up in journalctl).
+    eprintln!("[run] setup='{}' exec {}", name, spec.server.binary);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -476,16 +528,18 @@ extra_args = ["--parallel", "2"]
         let dir = tempfile::tempdir().unwrap();
         let model = dir.path().join("x.gguf");
         fs::write(&model, b"").unwrap();
+        let bin = owned_executable(dir.path());
         let spec = spec_from_toml(&format!(
             r#"
 [server]
-binary = "/bin/true"
+binary = "{}"
 host = "127.0.0.1"
 port = 0
 
 [model]
 main = "{}"
 "#,
+            bin.display(),
             model.display()
         ));
         let err = validate_spec(&spec).unwrap_err();
@@ -494,17 +548,20 @@ main = "{}"
 
     #[test]
     fn test_validate_spec_missing_main_model() {
-        let spec = spec_from_toml(
+        let dir = tempfile::tempdir().unwrap();
+        let bin = owned_executable(dir.path());
+        let spec = spec_from_toml(&format!(
             r#"
 [server]
-binary = "/bin/true"
+binary = "{}"
 host = "127.0.0.1"
 port = 8090
 
 [model]
 main = "/nonexistent/model.gguf"
 "#,
-        );
+            bin.display()
+        ));
         let err = validate_spec(&spec).unwrap_err();
         assert!(err.contains("main model"), "unexpected error: {}", err);
     }
@@ -526,6 +583,162 @@ main = "/nonexistent/model.gguf"
         assert!(err.contains("binary"), "unexpected error: {}", err);
     }
 
+    /// A runnable spec (real binary + model) so only the host/extra_args
+    /// rules under test can fail. `flags_toml` is an optional extra
+    /// `[flags]` section appended to the spec. The tempdir guard keeps the
+    /// model file alive for the duration of the test.
+    /// A temp executable owned by the test user, so validate_spec's
+    /// ownership/mode checks pass and the rule under test is what fires
+    /// (`/bin/true` is root-owned and would trip them for non-root runners).
+    fn owned_executable(dir: &std::path::Path) -> std::path::PathBuf {
+        let bin = dir.join("llama-server");
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    fn runnable_spec_with(flags_toml: &str) -> (SetupSpec, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = owned_executable(dir.path());
+        let model = dir.path().join("x.gguf");
+        fs::write(&model, b"").unwrap();
+        let spec = spec_from_toml(&format!(
+            r#"
+[server]
+binary = "{}"
+host = "127.0.0.1"
+port = 8090
+
+[model]
+main = "{}"
+{}"#,
+            bin.display(),
+            model.display(),
+            flags_toml
+        ));
+        (spec, dir)
+    }
+
+    #[test]
+    fn test_validate_spec_rejects_non_loopback_host() {
+        let (mut spec, _dir) = runnable_spec_with("");
+        spec.server.host = "0.0.0.0".into();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.contains("not a loopback"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_validate_spec_rejects_extra_args_host() {
+        let (spec, _dir) =
+            runnable_spec_with("\n[flags]\nextra_args = [\"--host\", \"0.0.0.0\"]\n");
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(
+            err.contains("extra_args") && err.contains("--host"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_rejects_extra_args_host_equals() {
+        let (spec, _dir) = runnable_spec_with("\n[flags]\nextra_args = [\"--host=0.0.0.0\"]\n");
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(
+            err.contains("extra_args") && err.contains("--host=0.0.0.0"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_rejects_extra_args_port() {
+        let (spec, _dir) = runnable_spec_with("\n[flags]\nextra_args = [\"--port\", \"9999\"]\n");
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(
+            err.contains("extra_args") && err.contains("--port"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_rejects_extra_args_port_equals() {
+        let (spec, _dir) = runnable_spec_with("\n[flags]\nextra_args = [\"--port=9999\"]\n");
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(
+            err.contains("extra_args") && err.contains("--port=9999"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_spec_rejects_non_finite_floats() {
+        let (spec, _dir) = runnable_spec_with("\n[flags]\ntemp = nan\ntop_p = inf\n");
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(
+            err.contains("not a finite number"),
+            "unexpected error: {}",
+            err
+        );
+        // Finite values are accepted.
+        let (spec, _dir) = runnable_spec_with("\n[flags]\ntemp = 0.8\ntop_p = 0.95\n");
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn test_binary_ownership_ok() {
+        let euid = unsafe { libc::geteuid() };
+        // Owner + sane mode: OK (group/other read+execute is allowed).
+        assert!(binary_ownership_ok(euid, euid, 0o755).is_ok());
+        assert!(binary_ownership_ok(euid, euid, 0o700).is_ok());
+        assert!(binary_ownership_ok(euid, euid, 0o754).is_ok());
+        // Group- or other-writable: rejected.
+        assert!(binary_ownership_ok(euid, euid, 0o775).is_err());
+        assert!(binary_ownership_ok(euid, euid, 0o757).is_err());
+        assert!(binary_ownership_ok(euid, euid, 0o664).is_err());
+        // Owned by another user: rejected even with a clean mode.
+        let other_uid = if euid == 0 { 1 } else { 0 };
+        assert!(binary_ownership_ok(other_uid, euid, 0o755).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_spec_rejects_group_writable_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("llama-server");
+        let model = tmp.path().join("x.gguf");
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        fs::write(&model, b"").unwrap();
+        let spec = spec_from_toml(
+            r#"
+[server]
+binary = "REPLACED_BIN"
+host = "127.0.0.1"
+port = 8090
+
+[model]
+main = "REPLACED_MAIN"
+"#,
+        );
+        let mut spec = spec;
+        spec.server.binary = bin.to_string_lossy().into();
+        spec.model.main = model.to_string_lossy().into();
+
+        // Group-writable: rejected.
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o775)).unwrap();
+        let err = validate_spec(&spec).unwrap_err();
+        assert!(err.contains("writable"), "unexpected error: {}", err);
+        // Owner-only writable: accepted.
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_spec(&spec).is_ok());
+    }
+
     /// Build a spec whose binary/model files exist, so cross-field rules
     /// (draft ⇒ spec_type, spec_draft_n_max ⇒ draft) are what gets exercised.
     fn spec_with_real_files(
@@ -535,10 +748,11 @@ main = "/nonexistent/model.gguf"
         let draft = dir.join("draft.gguf");
         fs::write(&main, b"x").unwrap();
         fs::write(&draft, b"x").unwrap();
+        let bin = owned_executable(dir);
         let spec = spec_from_toml(
             r#"
 [server]
-binary = "/bin/true"
+binary = "REPLACED_BIN"
 host = "127.0.0.1"
 port = 8090
 
@@ -548,6 +762,7 @@ draft = "REPLACED_DRAFT"
 "#,
         );
         let mut spec = spec;
+        spec.server.binary = bin.to_string_lossy().into();
         spec.model.main = main.to_string_lossy().into();
         spec.model.draft = Some(draft.to_string_lossy().into());
         (spec, main, draft)
@@ -572,13 +787,14 @@ draft = "REPLACED_DRAFT"
 
     #[test]
     fn test_validate_spec_spec_n_max_requires_draft() {
-        let tmp = std::env::temp_dir();
-        let main = tmp.join("llm-indicator-test-main2.gguf");
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("x.gguf");
         fs::write(&main, b"x").unwrap();
-        let spec = spec_from_toml(
+        let bin = owned_executable(dir.path());
+        let spec = spec_from_toml(&format!(
             r#"
 [server]
-binary = "/bin/true"
+binary = "{}"
 host = "127.0.0.1"
 port = 8090
 
@@ -586,7 +802,8 @@ port = 8090
 main = "REPLACED"
 spec_draft_n_max = 5
 "#,
-        );
+            bin.display()
+        ));
         let mut spec = spec;
         spec.model.main = main.to_string_lossy().into();
         let err = validate_spec(&spec).unwrap_err();
@@ -651,18 +868,20 @@ main = "/models/x.gguf"
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("model.gguf");
         fs::write(&main, b"x").unwrap();
+        let bin = owned_executable(dir.path());
         fs::write(
             dir.path().join("test-setup.toml"),
             format!(
                 r#"
 [server]
-binary = "/bin/true"
+binary = "{}"
 host = "127.0.0.1"
 port = 8099
 
 [model]
 main = "{}"
 "#,
+                bin.to_string_lossy(),
                 main.to_string_lossy()
             ),
         )

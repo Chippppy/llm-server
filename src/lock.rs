@@ -166,28 +166,10 @@ fn unlock_fd(_file: &std::fs::File) {}
 /// otherwise it lives under the user's XDG
 /// state dir, falling back to the config dir, and finally the temp dir
 /// (with a warning, since a temp-dir lock may not be shared).
-/// Test-only override of the lock path for the current thread.
-///
-/// The CLI handlers run synchronously in the caller's thread, so a
-/// thread-local override is race-free — unlike the process environment,
-/// which is shared across test threads and unsafe to mutate while other
-/// threads read it.
-#[cfg(test)]
-pub(crate) fn set_test_lock_path(path: Option<PathBuf>) {
-    TEST_LOCK_PATH.with(|slot| *slot.borrow_mut() = path);
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_LOCK_PATH: std::cell::RefCell<Option<PathBuf>> =
-        std::cell::RefCell::new(None);
-}
-
 fn lock_path() -> PathBuf {
-    #[cfg(test)]
-    if let Some(path) = TEST_LOCK_PATH.with(|slot| slot.borrow().clone()) {
-        return path;
-    }
+    // The CLI wiring tests override the path via `LLM_SERVER_CTL_LOCK_PATH`
+    // (serialized with a mutex, since the process environment is shared
+    // across test threads).
     if let Ok(value) = std::env::var("LLM_SERVER_CTL_LOCK_PATH") {
         if !value.is_empty() {
             return PathBuf::from(value);

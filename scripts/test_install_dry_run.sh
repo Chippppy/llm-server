@@ -28,6 +28,14 @@ else
   fail "sudoers dry-run not found"
 fi
 
+# The generated content must carry the user-spec tag prefix; without it the
+# file is not valid sudoers and visudo -c would reject it.
+if echo "$OUTPUT" | grep -q "ALL=(ALL) NOPASSWD:"; then
+  echo "PASS: sudoers NOPASSWD tag prefix detected"
+else
+  fail "sudoers NOPASSWD tag prefix not found"
+fi
+
 if echo "$OUTPUT" | grep -q "Would install.*llm-server-ctl"; then
   echo "PASS: llm-server-ctl install dry-run detected"
 else

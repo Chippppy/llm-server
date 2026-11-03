@@ -4,7 +4,7 @@ Run and swap multiple local llama.cpp servers (`llama-server`), each with its ow
 
 - `llm-server-ctl` — CLI for status/health, start/stop, and exclusive model swapping
 - systemd **template units** (`llm-server@<name>.service`) — one instance per setup
-- an egui GUI + system tray (`llm-server-indicator --gui`)
+- an egui GUI (`llm-server-indicator --gui`)
 - a Waybar module rendering aggregate status
 
 ## Sample setup templates
@@ -72,7 +72,7 @@ llm-server-ctl start --service muse --wait --timeout 300
 llm-server-ctl status --service qwen --json  # single-service JSON
 ```
 
-`llm-server-indicator` is the GUI binary but also delegates to the CLI: `llm-server-indicator --gui` opens the egui window/tray, any other arguments behave like `llm-server-ctl`.
+`llm-server-indicator` is the GUI binary but also delegates to the CLI: `llm-server-indicator --gui` opens the egui window, any other arguments behave like `llm-server-ctl`.
 
 ## Configuration
 
@@ -154,9 +154,9 @@ cd llm-server
 
 `scripts/install.sh` (requires `cargo`, `sudo`, `systemctl`, `visudo`):
 
-1. `cargo install --path .` (builds `llm-server-ctl` and `llm-server-indicator`)
+1. `cargo install --path . --locked` (builds `llm-server-ctl` and `llm-server-indicator`)
 2. Installs `llm-server-ctl` to `/usr/local/bin/llm-server-ctl` — the stable absolute path the template unit's `ExecStart` calls
-3. Writes `/etc/sudoers.d/llm-server-$USER` granting NOPASSWD `systemctl start|stop|restart|status|is-active` for `llm-server.service` and `llm-server@*.service` (validated with `visudo -c`, written atomically) — review it, and delete it if you don't need passwordless control
+3. Writes `/etc/sudoers.d/llm-server-<user>` (filename sanitized to `[a-zA-Z0-9_-]`, the only charset sudo honors in `sudoers.d`) granting NOPASSWD `systemctl start|stop|status|is-active` for `llm-server.service` (exact strings) and `llm-server@<name>.service` (anchored per-verb extended regex — one unit per invocation, extra arguments impossible; requires sudo ≥ 1.9.10, which the script checks) — validated with `visudo -c`, written atomically. Review it, and delete it if you don't need passwordless control. `restart` is deliberately excluded: `stop` + `start` covers the need without giving passwordless control of the restart path
 4. Installs `systemd/llm-server@.service` to `/etc/systemd/system/` with `User=` substituted to the installing user (existing unit backed up with a timestamp), then `daemon-reload`
 5. Copies `setups/*.template.toml` → `~/.config/llm-server-indicator/setups/` only if the destination file does not already exist (never clobbers user specs)
 6. Copies `config/default.toml` → `~/.config/llm-server-indicator/config.toml` **only if it doesn't already exist** (never overwrites user edits)
@@ -170,7 +170,7 @@ cd llm-server
 ./scripts/install-waybar.sh           # preview: DRY_RUN=1 ./scripts/install-waybar.sh
 ```
 
-Writes `waybar/llm-server-module.json` to `~/.config/waybar/modules/llm-server-module.json` (existing file backed up to `.bak`) and appends `waybar/style.css` to `~/.config/waybar/style.css`. It does **not** modify your Waybar config — the config must import the module file and list `custom/llm-server` in a modules array; the script warns if it doesn't see that.
+Writes `waybar/llm-server-module.json` to `~/.config/waybar/modules/` and `waybar/group-llm.json` to `~/.config/waybar/groups/` (existing files backed up to `.bak`), appends `waybar/style.css` to `~/.config/waybar/style.css`, and **patches** `~/.config/waybar/config.jsonc` idempotently (backed up to `.bak` before the first edit): it adds the group include next to the module include and replaces `custom/llm-server` with `group/llm` in a modules array — see the [Waybar](#waybar) section below. If the config doesn't import the module file or list either entry, it prints the manual steps instead of guessing.
 
 ### Uninstall
 
@@ -178,17 +178,18 @@ Writes `waybar/llm-server-module.json` to `~/.config/waybar/modules/llm-server-m
 ./scripts/uninstall.sh
 ```
 
-Stops running `llm-server@*.service` instances, removes the template unit, `/usr/local/bin/llm-server-ctl`, the sudoers file, and `~/.config/llm-server-indicator` (plus the v1 autostart desktop entry if present). The Waybar integration and any legacy v1 unit are left in place on purpose.
+Stops running `llm-server@*.service` instances, removes the template unit, `/usr/local/bin/llm-server-ctl` and `/usr/local/bin/llm-server-indicator`, the sudoers file, and `~/.config/llm-server-indicator` (plus the v1 autostart desktop entry if present). The Waybar integration (module, group, and config edits) and any legacy v1 unit are left in place — uninstall does not revert the config edits; remove them manually (the installer's `~/.config/waybar/config.jsonc.bak` backup is there for that).
 
 ## Security notes
 
 Read these before installing on a shared or networked machine:
 
-- **Your config directory is code.** `setups/<name>.toml`'s `binary` field is `exec()`-ed by systemd. Anyone who can write `~/.config/llm-server-indicator/` can get code execution as your user. Keep the directory private (the installer writes `config.toml` and the setup templates with mode `600`), and don't pull that directory from untrusted dotfiles repos.
-- **The sudoers grant is a wildcard, on purpose.** The NOPASSWD entry covers every `llm-server@*.service` instance — that's what lets a new setup start without a new unit file or sudoers edit. It is scoped to five `systemctl` verbs (`start`/`stop`/`restart`/`status`/`is-active`) and the installing user only, and instances run as that user (`NoNewPrivileges=true`). If you don't need passwordless control, delete `/etc/sudoers.d/llm-server-$USER`.
-- **`llama-server` has no authentication.** The default bind is `127.0.0.1`, which is still reachable by *every local user* on a multi-user box. Keep `host` on loopback there; if you ever expose the server beyond loopback (e.g. via `extra_args`), protect it yourself (API key, firewall) — the schema's `host` field and `extra_args` both influence the bind, and `extra_args` is an unvalidated escape hatch.
+- **Your config directory is code.** `setups/<name>.toml`'s `binary` field is `exec()`-ed by systemd. Anyone who can write `~/.config/llm-server-indicator/` can get code execution as your user. Keep the directory private (the installer writes the directory with mode `700` and `config.toml` and the setup templates with mode `600`), and don't pull that directory from untrusted dotfiles repos.
+- **Never put secrets in `extra_args`.** Setup flags are passed on the `llama-server` command line, so anything in `flags.extra_args` (API keys included) is visible in `/proc/<pid>/cmdline` to your own sessions and to root. Keep credentials out of setup files entirely.
+- **The sudoers grant is anchored per verb, on purpose.** The NOPASSWD entry covers every `llm-server@<name>.service` instance — that's what lets a new setup start without a new unit file or sudoers edit. sudoers(5) matches command arguments as ONE concatenated string in which `*` also matches whitespace, so an unanchored `llm-server@*.service` would match `llm-server@x.service /tmp/evil.service` and let a local user run an arbitrary unit path as root. The grant therefore uses anchored extended-regex arguments, one per verb (`^start llm-server@[A-Za-z0-9._-]+\.service$` and friends; regex command arguments require sudo ≥ 1.9.10, which the installer enforces) so exactly one unit and nothing else may follow the verb — the legacy `llm-server.service` entries are exact strings with no wildcards. It is scoped to four `systemctl` verbs (`start`/`stop`/`status`/`is-active`) and the installing user only, and instances run as that user (`NoNewPrivileges=true`). `restart` is excluded on purpose — combined with the unit exec'ing a binary path taken from your (user-writable) setup TOML, passwordless restart would let a same-user compromise keep a malicious setup alive silently; `stop` then `start` gives you the same control. If you don't need passwordless control, delete `/etc/sudoers.d/llm-server-<user>`.
+- **`llama-server` has no authentication.** The default bind is `127.0.0.1`, which is still reachable by *every local user* on a multi-user box. `llm-server-ctl run` refuses to start with a non-loopback `server.host` (only `127.0.0.1`, `::1`, `localhost`) and rejects `--host`/`--port` in `flags.extra_args` (which would override the validated bind), so the server can't be exposed to the network through a setup file.
 - **`install.sh` runs with full sudo.** Treat any fork of this repository as root-equivalent: clone only from the trusted source, and review the script before running it.
-- Health checks (`health_url`) make plain outbound HTTP requests with no auth; point them at your own servers.
+- Health checks (`health_url`) make plain outbound HTTP requests with no auth; point them at your own servers. A `health_url` that is neither a loopback host nor `https://` triggers a warning at startup — it is polled repeatedly, so a config from an untrusted dotfiles repo could use it as a data-exfiltration beacon.
 
 ## Migrating from v1
 
@@ -198,7 +199,7 @@ Existing users of the legacy single-server unit: after running `scripts/install.
 
 The Waybar integration is a **drawer group** (`group/llm`) in the style of Waybar's sliding group modules: the aggregate status is always visible, and hovering over it slides out one button per model.
 
-- `waybar/llm-server-module.json` — the group **leader**. Runs `llm-server-ctl status --all --json` every 5 s and renders the aggregate JSON directly (`return-type: "json`):
+- `waybar/llm-server-module.json` — the group **leader**. Runs `llm-server-ctl status --all --json` every 5 s and renders the aggregate JSON directly (`return-type: "json"`):
   - **text** — the active setup with an icon (e.g. `󰍲 Qwen 3.8 27B`), or `󰐇 LLM off` when nothing is running
   - **tooltip** — one line per service: `<display name>: <state>`
   - **class** — `active` / `loading` / `unhealthy` / `inactive` (any failed/unhealthy service wins, then any activating/deactivating, then any active)

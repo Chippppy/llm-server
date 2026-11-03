@@ -1,22 +1,30 @@
 //! UI module using egui
-//! Provides a GUI window with service list, status, controls, logs and tray integration.
+//! Provides a GUI window with service list, status, controls, and logs.
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use egui::{CentralPanel, Color32, Context, RichText};
 use egui_winit::State;
 use once_cell::sync::Lazy;
+use std::time::Duration;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoopBuilder;
 use winit::window::WindowBuilder;
 
 use crate::config::{load_config, ServiceConfig};
+use crate::lock::ProcessLock;
 use crate::service::{ServiceController, ServiceState};
 
 static LOGS_CACHE: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Lock the log cache, recovering from poisoning: a panic in a background
+/// fetch thread must not take down the GUI.
+fn logs_cache_lock() -> MutexGuard<'static, HashMap<String, String>> {
+    LOGS_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum ConfirmAction {
@@ -31,7 +39,6 @@ struct ServiceInfo {
     controller: ServiceController,
     state: ServiceState,
     healthy: bool,
-    last_state: Option<ServiceState>,
     loading: bool,
 }
 
@@ -41,6 +48,9 @@ struct App {
     confirm_action: Option<ConfirmAction>,
     pending_action: Option<ConfirmAction>,
     selected_log_service: Option<String>,
+    /// Last failed action's error, shown above the service list (cleared on
+    /// the next successful action).
+    last_error: Option<String>,
 }
 
 impl App {
@@ -56,7 +66,6 @@ impl App {
                 controller,
                 state,
                 healthy,
-                last_state: None,
                 loading: false,
             });
         }
@@ -66,6 +75,7 @@ impl App {
             confirm_action: None,
             pending_action: None,
             selected_log_service: None,
+            last_error: None,
         })
     }
 
@@ -80,7 +90,6 @@ impl App {
                 let title = "Service state changed";
                 let body = format!("{} is now {:?}", svc.config.display_name, svc.state);
                 svc.controller.notify(title, &body);
-                svc.last_state = Some(svc.state.clone());
             }
         }
         self.last_poll = Instant::now();
@@ -92,35 +101,130 @@ impl App {
             ConfirmAction::Stop(n) => (n.clone(), "stop"),
             ConfirmAction::Toggle(n) => (n.clone(), "toggle"),
         };
-        if let Some(svc) = self.services.iter_mut().find(|s| s.name == name) {
-            svc.loading = true;
-            let res = match act {
-                "start" => svc.controller.start(),
-                "stop" => svc.controller.stop(),
-                "toggle" => {
-                    let is_running = matches!(
-                        svc.state,
-                        ServiceState::Active | ServiceState::Unhealthy | ServiceState::Loading
-                    );
-                    if is_running {
-                        svc.controller.stop()
-                    } else {
-                        svc.controller.start()
-                    }
-                }
-                _ => Ok(()),
+        let idx = self
+            .services
+            .iter()
+            .position(|s| s.name == name)
+            .ok_or_else(|| format!("Service '{}' not found", name))?;
+
+        // Same serialization as the CLI's `toggle`/`activate`: hold the
+        // non-blocking process lock for the whole action so a concurrent
+        // `llm-server-ctl` command cannot interleave. If another command
+        // holds it, fail fast with the lock's "already running" message.
+        let _lock = ProcessLock::acquire().map_err(|e| format!("{}: {}", act, e))?;
+
+        // Fresh (name, group, combined_state) for every configured service —
+        // the same input shape the CLI feeds to `members_to_stop`.
+        let mut entries: Vec<(String, String, ServiceState)> = self
+            .services
+            .iter()
+            .map(|s| {
+                let (state, _) = s.controller.combined_state();
+                (s.name.clone(), s.config.group.clone(), state)
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let target_state = entries
+            .iter()
+            .find(|(n, _, _)| n == &name)
+            .map(|(_, _, state)| state.clone());
+
+        // `toggle` starts iff the target is not running (same rule as the
+        // CLI's `toggle_is_stop`).
+        let is_start = match act {
+            "start" => true,
+            "stop" => false,
+            _ => !target_state
+                .as_ref()
+                .map_or(false, crate::cli::toggle_is_stop),
+        };
+
+        let res = if is_start {
+            // Exclusive groups: stop same-group peers before starting, exactly
+            // like the CLI's `activate`/`toggle`, so two models in one group
+            // never load at once. An already-Active target is a no-op there,
+            // so it skips the peer stop (matching `activate`'s no-op rule).
+            let peers = if matches!(target_state, Some(ServiceState::Active)) {
+                Vec::new()
+            } else {
+                crate::cli::members_to_stop(&name, &entries)
             };
+            let mut stopped = Vec::new();
+            for peer in peers {
+                let Some(p) = self.services.iter_mut().find(|s| s.name == peer) else {
+                    continue;
+                };
+                p.loading = true;
+                let r = p.controller.stop();
+                p.loading = false;
+                if let Err(e) = r {
+                    return Err(format!(
+                        "Failed to stop '{}' before starting '{}': {:?} (stopped: {})",
+                        peer,
+                        name,
+                        e,
+                        stopped.join(", ")
+                    ));
+                }
+                stopped.push(peer);
+            }
+            let svc = &mut self.services[idx];
+            svc.loading = true;
+            let r = svc.controller.start();
             svc.loading = false;
-            let (s, h) = svc.controller.combined_state();
-            svc.state = s;
-            svc.healthy = h;
-            res.map_err(|e| format!("Action failed: {:?}", e))
+            r.map_err(|e| {
+                format!(
+                    "Failed to start '{}': {:?} (stopped: {})",
+                    name,
+                    e,
+                    stopped.join(", ")
+                )
+            })
         } else {
-            Err(format!("Service {} not found", name))
-        }
+            let svc = &mut self.services[idx];
+            svc.loading = true;
+            let r = svc.controller.stop();
+            svc.loading = false;
+            r.map_err(|e| format!("Failed to stop '{}': {:?}", name, e))
+        };
+
+        let svc = &mut self.services[idx];
+        let (s, h) = svc.controller.combined_state();
+        svc.state = s;
+        svc.healthy = h;
+        res
     }
 
-    // fetch_logs removed, use static function
+    /// Cheap fingerprint of everything the window renders, so `run_gui`
+    /// only requests a follow-up redraw when the visible state actually
+    /// changed (instead of redrawing at max FPS).
+    fn fingerprint(&self) -> String {
+        let mut f = String::new();
+        for svc in &self.services {
+            f.push_str(&format!("{:?}|{}|{}", svc.state, svc.healthy, svc.loading));
+        }
+        f.push('|');
+        f.push_str(&format!(
+            "{:?}{:?}{:?}|",
+            self.confirm_action, self.pending_action, self.selected_log_service
+        ));
+        // The log window's content changes when the background fetch lands
+        // in the cache, even though no App field does.
+        if let Some(name) = &self.selected_log_service {
+            if let Some(svc) = self.services.iter().find(|s| s.name == *name) {
+                let cache = logs_cache_lock();
+                f.push(if cache.contains_key(&svc.config.unit) {
+                    'c'
+                } else {
+                    ' '
+                });
+            }
+        }
+        if let Some(err) = &self.last_error {
+            f.push_str(err);
+        }
+        f
+    }
 }
 
 fn state_color(state: &ServiceState, healthy: bool) -> Color32 {
@@ -163,11 +267,18 @@ impl App {
     fn ui(&mut self, ctx: &Context) {
         // Process pending action
         if let Some(action) = self.pending_action.take() {
-            let _ = self.perform_action(&action);
+            match self.perform_action(&action) {
+                Ok(()) => self.last_error = None,
+                Err(e) => self.last_error = Some(e),
+            }
         }
 
         CentralPanel::default().show(ctx, |ui| {
             ui.heading("LLM Server Indicator");
+            if let Some(err) = &self.last_error {
+                ui.colored_label(Color32::from_rgb(255, 0, 0), format!("Error: {}", err));
+                ui.separator();
+            }
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -248,7 +359,7 @@ impl App {
             if let Some(svc) = self.services.iter().find(|s| s.name == name) {
                 // Trigger async fetch if not cached
                 let unit = svc.config.unit.clone();
-                let cache = LOGS_CACHE.lock().unwrap();
+                let cache = logs_cache_lock();
                 let cached = cache.get(&unit).cloned();
                 drop(cache);
                 if cached.is_none() {
@@ -256,7 +367,7 @@ impl App {
                     let unit_clone = unit.clone();
                     std::thread::spawn(move || {
                         let logs = fetch_logs_static(&unit_clone);
-                        let mut cache = LOGS_CACHE.lock().unwrap();
+                        let mut cache = logs_cache_lock();
                         cache.insert(unit_clone, logs);
                     });
                 }
@@ -269,14 +380,14 @@ impl App {
                         if ui.button("Refresh").clicked() {
                             // Invalidate cache and refetch
                             {
-                                let mut cache = LOGS_CACHE.lock().unwrap();
+                                let mut cache = logs_cache_lock();
                                 cache.remove(&unit);
                             }
                             // Trigger new fetch
                             let unit_clone = unit.clone();
                             std::thread::spawn(move || {
                                 let logs = fetch_logs_static(&unit_clone);
-                                let mut cache = LOGS_CACHE.lock().unwrap();
+                                let mut cache = logs_cache_lock();
                                 cache.insert(unit_clone, logs);
                             });
                             log_text = "Loading logs...".to_string();
@@ -308,17 +419,31 @@ pub fn run_gui() -> Result<(), String> {
     );
     let mut app = App::new()?;
     let mut last_poll = Instant::now();
+    let mut last_fingerprint = String::new();
+
+    // winit 0.29 has no delayed redraw (request_redraw_at landed in 0.30),
+    // so a single timer thread wakes the event loop every 2 s via a user
+    // event; the NewEvents arm requests the redraw and the 2 s poll check
+    // below does the probing — still on the GUI thread.
+    let proxy = event_loop.create_proxy();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let _ = proxy.send_event(());
+    });
 
     let _ = event_loop.run(move |event, _| match event {
         Event::WindowEvent { event, .. } => {
             let response = egui_state.on_window_event(&window, &event);
+            if response.repaint {
+                window.request_redraw();
+            }
             if !response.consumed {
                 match event {
                     WindowEvent::CloseRequested => {
                         std::process::exit(0);
                     }
                     WindowEvent::RedrawRequested => {
-                        if last_poll.elapsed() >= std::time::Duration::from_secs(2) {
+                        if last_poll.elapsed() >= Duration::from_secs(2) {
                             app.poll();
                             last_poll = Instant::now();
                         }
@@ -327,7 +452,14 @@ pub fn run_gui() -> Result<(), String> {
                             app.ui(ctx);
                         });
                         egui_state.handle_platform_output(&window, output.platform_output);
-                        window.request_redraw();
+                        // Redraw only when the visible state actually
+                        // changed since the last draw; the timer thread
+                        // above keeps the 2 s poll alive while idle.
+                        let fingerprint = app.fingerprint();
+                        if fingerprint != last_fingerprint {
+                            last_fingerprint = fingerprint;
+                            window.request_redraw();
+                        }
                     }
                     _ => {}
                 }

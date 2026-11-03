@@ -8,13 +8,23 @@ use once_cell::sync::Lazy;
 
 use crate::config::ServiceConfig;
 
-static HEALTH_RUNTIME: Lazy<tokio::runtime::Runtime> =
-    Lazy::new(|| tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+static HEALTH_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    // current-thread: health probes are sequential, and waybar spawns a
+    // short-lived CLI process every ~2 s — a multi-thread runtime would
+    // waste a whole thread pool per process.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime")
+});
 
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
+        // Scrub proxy env: a stray HTTP_PROXY/HTTPS_PROXY would misroute
+        // loopback health polls.
+        .no_proxy()
         .build()
         .expect("Failed to build reqwest client")
 });
@@ -59,6 +69,8 @@ impl ServiceController {
 
     pub(crate) fn validate_unit_name(unit: &str) -> bool {
         !unit.trim().is_empty()
+            // A leading '-' would parse as a systemctl option in the argv.
+            && !unit.starts_with('-')
             && unit
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
@@ -115,10 +127,13 @@ impl ServiceController {
                 "systemctl start failed: stderr={}",
                 String::from_utf8_lossy(&output.stderr)
             ));
-            Err(ServiceError::Command(format!(
-                "Failed to start {}",
-                self.service_config.unit
-            )))
+            // Surface systemctl's stderr (logger is None in production,
+            // so without this the failure reason is lost).
+            Err(command_error(
+                "start",
+                &self.service_config.unit,
+                &output.stderr,
+            ))
         }
     }
 
@@ -141,10 +156,11 @@ impl ServiceController {
                 "systemctl stop failed: stderr={}",
                 String::from_utf8_lossy(&output.stderr)
             ));
-            Err(ServiceError::Command(format!(
-                "Failed to stop {}",
-                self.service_config.unit
-            )))
+            Err(command_error(
+                "stop",
+                &self.service_config.unit,
+                &output.stderr,
+            ))
         }
     }
 
@@ -304,6 +320,33 @@ impl WaitTracker {
     fn crashed_after_load(&self) -> bool {
         self.ever_listening && self.missed >= 2
     }
+}
+
+/// `ServiceError::Command` for a failed `systemctl <verb> <unit>`, with the
+/// last ~500 chars of stderr (trimmed, folded to one line) when available.
+fn command_error(verb: &str, unit: &str, stderr: &[u8]) -> ServiceError {
+    let detail = stderr_tail(stderr);
+    if detail.is_empty() {
+        ServiceError::Command(format!("Failed to {} {}", verb, unit))
+    } else {
+        ServiceError::Command(format!("Failed to {} {}: {}", verb, unit, detail))
+    }
+}
+
+/// Trimmed, single-line tail (last ~500 chars) of a subprocess stderr.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(stderr)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.len() > 500 {
+        let mut start = text.len() - 500;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        text = text[start..].to_string();
+    }
+    text
 }
 
 /// Pure bail decision for the wait loop.
@@ -533,6 +576,18 @@ mod tests {
         ));
         assert!(!ServiceController::validate_unit_name(""));
         assert!(!ServiceController::validate_unit_name("bad unit!"));
+        // A leading '-' would parse as a systemctl option in the argv.
+        assert!(!ServiceController::validate_unit_name("-evil.service"));
+    }
+
+    #[test]
+    fn test_stderr_tail() {
+        assert_eq!(stderr_tail(b""), "");
+        assert_eq!(stderr_tail(b"  line1\nline2  "), "line1 line2");
+        let long = vec![b'a'; 600];
+        let tail = stderr_tail(&long);
+        assert_eq!(tail.len(), 500, "long stderr is truncated to the tail");
+        assert!(tail.starts_with('a') && tail.ends_with('a'));
     }
 
     #[test]
@@ -572,11 +627,15 @@ mod tests {
         );
         let ctrl = ServiceController::new(cfg, None);
         let started = std::time::Instant::now();
-        let healthy = ctrl.wait_until_healthy(Duration::from_secs(60));
+        // Short deadline: on machines where the unit state cannot be read
+        // (e.g. sudo denies is-active for this unit name, so the state is
+        // Unknown) the wait polls until the deadline — keep that bounded so
+        // the test stays fast and low-impact.
+        let healthy = ctrl.wait_until_healthy(Duration::from_secs(2));
         assert!(!healthy, "unreachable unit must not report healthy");
         // Bailing on inactive/failed should be fast (< 5 s).
-        // (On systems where systemd is unreachable the state is Unknown and we
-        // poll until timeout — guard the wall-clock assertion for that case.)
+        // (If the state is Unknown we poll until the deadline instead —
+        // guard the wall-clock assertion for that case.)
         if ctrl.status() == ServiceState::Inactive || ctrl.status() == ServiceState::Failed {
             assert!(
                 started.elapsed() < Duration::from_secs(5),

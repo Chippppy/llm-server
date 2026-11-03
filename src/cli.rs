@@ -486,6 +486,16 @@ fn handle_toggle(cli: &Cli) -> Result<(), String> {
         .ok_or_else(|| "Missing required --service argument for toggle".to_string())?;
     validate_service_name(service_name)?;
     let cfg = load_config().map_err(|e| format!("Failed to load config: {}", e))?;
+    if !cfg.services.contains_key(service_name) {
+        return Err(format!("Service '{}' not found in config", service_name));
+    }
+
+    // Serialize the stop-peers→start sequence against concurrent `activate`,
+    // `stop --all`, and other `toggle` runs (two models in one exclusive
+    // group loading at once would exhaust VRAM); held until return, same
+    // pattern as `activate`.
+    let _lock = ProcessLock::acquire().map_err(|e| format!("toggle: {}", e))?;
+
     let controller = controller_for(&cfg, service_name)?;
     let (current_state, _) = controller.combined_state();
     let (status, stopped) = if toggle_is_stop(&current_state) {
@@ -695,7 +705,7 @@ fn handle_services(cli: &Cli) -> Result<(), String> {
 /// as running (it occupies VRAM on its way in). `Activating` is *not*
 /// running, so toggling an activating target takes the start path (where
 /// `systemctl start` is effectively a no-op while the unit activates).
-fn toggle_is_stop(state: &ServiceState) -> bool {
+pub(crate) fn toggle_is_stop(state: &ServiceState) -> bool {
     matches!(
         state,
         ServiceState::Active | ServiceState::Unhealthy | ServiceState::Loading
@@ -721,7 +731,10 @@ fn activate_is_noop(target: Option<&ServiceState>) -> bool {
 /// they are on their way to occupying VRAM — exclusive groups must never
 /// have two models loading at once. The target itself is never included,
 /// and an unknown target yields an empty vec.
-fn members_to_stop(target: &str, services: &[(String, String, ServiceState)]) -> Vec<String> {
+pub(crate) fn members_to_stop(
+    target: &str,
+    services: &[(String, String, ServiceState)],
+) -> Vec<String> {
     let Some((_, target_group, _)) = services.iter().find(|(name, _, _)| name.as_str() == target)
     else {
         return Vec::new();
@@ -891,6 +904,7 @@ fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvSetGuard;
 
     /// Scratch base for the wiring tests' temp dirs.
     ///
@@ -1451,26 +1465,108 @@ mod tests {
         ));
     }
 
+    /// Shared setup for the lock-wiring tests (activate / stop --all /
+    /// toggle).
+    ///
+    /// - `LLM_SERVER_CTL_LOCK_PATH` points at a unique temp lock file that
+    ///   the test holds, so the handler under test can never contend with
+    ///   the real lock at the user's XDG state dir.
+    /// - `XDG_CONFIG_HOME` points at a fixture whose only service uses a
+    ///   unit that does not exist. This matters: in sandboxed environments
+    ///   the test lock file can be deleted out from under the held flock
+    ///   (`flock` only contends on the same inode), letting the handler
+    ///   acquire a fresh lock and proceed. The old tests then loaded the
+    ///   *real* user config and ran `systemctl stop`/`start` on the *real*
+    ///   units — which stopped the real LLM server. With the fixture, the
+    ///   worst case is `systemctl` calls on a non-existent unit (which
+    ///   fail) and no health probe (an inactive unit is never probed).
+    struct LockTestSetup {
+        #[cfg_attr(not(unix), allow(dead_code))]
+        lock_path: std::path::PathBuf,
+        /// Identity of the lock file at acquire time, for
+        /// `assert_lock_file_intact`.
+        #[cfg(unix)]
+        lock_meta: std::fs::Metadata,
+        _held: crate::lock::ProcessLock,
+        _env_lock: EnvSetGuard,
+        _env_config: EnvSetGuard,
+        _dir: tempfile::TempDir,
+        _mutex: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn lock_test_setup() -> LockTestSetup {
+        // Serialized against *all* env-mutating tests in the crate (including
+        // the config tests) via the shared process-wide env mutex.
+        let mutex = crate::test_support::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir_in(&test_scratch_base()).expect("tempdir");
+        let xdg = dir.path();
+        std::fs::create_dir_all(xdg.join("llm-server-indicator")).expect("mkdir");
+        std::fs::write(
+            xdg.join("llm-server-indicator/config.toml"),
+            r#"[services.muse]
+unit = "llm-server@locktest-fake.service"
+display_name = "LockTest"
+health_url = "http://127.0.0.1:1/health"
+group = "default"
+"#,
+        )
+        .expect("write fixture config");
+        let lock_path = xdg.join("llm-server-ctl.lock");
+        let env_lock = EnvSetGuard::set("LLM_SERVER_CTL_LOCK_PATH", &lock_path);
+        let env_config = EnvSetGuard::set("XDG_CONFIG_HOME", xdg);
+        let held = crate::lock::ProcessLock::acquire_at(&lock_path).expect("test holds the lock");
+        #[cfg(unix)]
+        let lock_meta = std::fs::metadata(&lock_path).expect("stat lock file");
+        LockTestSetup {
+            lock_path,
+            #[cfg(unix)]
+            lock_meta,
+            _held: held,
+            _env_lock: env_lock,
+            _env_config: env_config,
+            _dir: dir,
+            _mutex: mutex,
+        }
+    }
+
+    /// Assert the lock file is still the very file the held lock was taken
+    /// on. If the environment deleted (and possibly re-created) it, the
+    /// handler would acquire a fresh lock and proceed to real systemctl
+    /// calls — fail loudly *before* invoking the handler instead. The
+    /// fixture config makes even the missed case harmless (see
+    /// `lock_test_setup`); this check just makes the failure clear.
+    #[cfg(unix)]
+    fn assert_lock_file_intact(setup: &LockTestSetup) {
+        use std::os::unix::fs::MetadataExt;
+        let after = std::fs::metadata(&setup.lock_path).unwrap_or_else(|_| {
+            panic!(
+                "test lock file {} disappeared before the handler ran (environment interference); aborting so no real systemctl calls happen",
+                setup.lock_path.display()
+            )
+        });
+        assert_eq!(
+            (after.dev(), after.ino()),
+            (setup.lock_meta.dev(), setup.lock_meta.ino()),
+            "test lock file was replaced before the handler ran (environment interference); aborting so no real systemctl calls happen"
+        );
+    }
+
     #[test]
     fn test_activate_fails_when_lock_held() {
-        // The lock path is injected via a thread-local override (the handler
-        // runs synchronously on this thread), never via the process
-        // environment: mutating env from a test thread races with the other
-        // test threads reading it.
-        //
-        // The handler loads the ambient config (user config or the repo
-        // default, both of which define "muse") before acquiring the lock,
-        // so no config fixture is needed.
-        let dir = tempfile::tempdir_in(&test_scratch_base()).expect("tempdir");
-        let lock_path = dir.path().join("llm-server-ctl.lock");
-        crate::lock::set_test_lock_path(Some(lock_path.clone()));
-        let held = crate::lock::ProcessLock::acquire_at(&lock_path).expect("test holds the lock");
+        // The handler runs synchronously on this thread; the lock path and
+        // config dir are injected via process env, serialized by the shared
+        // `crate::test_support::ENV_MUTEX` (see `lock_test_setup` for why
+        // the fixture config is required for hermeticity).
+        let setup = lock_test_setup();
+        #[cfg(unix)]
+        assert_lock_file_intact(&setup);
 
         let cli = Cli::parse_from(["llm-server-ctl", "activate", "--service", "muse"]);
         let result = handle_activate(&cli, true, 5);
 
-        crate::lock::set_test_lock_path(None);
-        drop(held);
+        drop(setup);
 
         let err = result.expect_err("handle_activate must fail while the lock is held");
         assert!(
@@ -1482,20 +1578,37 @@ mod tests {
 
     #[test]
     fn test_stop_all_fails_when_lock_held() {
-        // See `test_activate_fails_when_lock_held` for why the lock path is
-        // injected via thread-local override rather than the environment.
-        let dir = tempfile::tempdir_in(&test_scratch_base()).expect("tempdir");
-        let lock_path = dir.path().join("llm-server-ctl.lock");
-        crate::lock::set_test_lock_path(Some(lock_path.clone()));
-        let held = crate::lock::ProcessLock::acquire_at(&lock_path).expect("test holds the lock");
+        // See `lock_test_setup` / `test_activate_fails_when_lock_held`.
+        let setup = lock_test_setup();
+        #[cfg(unix)]
+        assert_lock_file_intact(&setup);
 
         let cli = Cli::parse_from(["llm-server-ctl", "stop", "--all"]);
         let result = handle_stop_all(&cli);
 
-        crate::lock::set_test_lock_path(None);
-        drop(held);
+        drop(setup);
 
         let err = result.expect_err("handle_stop_all must fail while the lock is held");
+        assert!(
+            err.contains("already running"),
+            "unexpected error message: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_toggle_fails_when_lock_held() {
+        // See `lock_test_setup` / `test_activate_fails_when_lock_held`.
+        let setup = lock_test_setup();
+        #[cfg(unix)]
+        assert_lock_file_intact(&setup);
+
+        let cli = Cli::parse_from(["llm-server-ctl", "toggle", "--service", "muse"]);
+        let result = handle_toggle(&cli);
+
+        drop(setup);
+
+        let err = result.expect_err("handle_toggle must fail while the lock is held");
         assert!(
             err.contains("already running"),
             "unexpected error message: {}",

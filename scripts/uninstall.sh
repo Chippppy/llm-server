@@ -5,11 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_DIR="$HOME/.config/llm-server-indicator"
 AUTOSTART_DIR="$HOME/.config/autostart"
 AUTOSTART_FILE="$AUTOSTART_DIR/llm-server-indicator.desktop"
-# whoami, not $USER — must match the name install.sh derived the sudoers file from
-SUDOERS_FILE="/etc/sudoers.d/llm-server-$(whoami)"
+# whoami, not $USER — must match the name install.sh derived the sudoers file
+# from (same sanitization: sudo only honors [a-zA-Z0-9_-]+ filenames there)
+SUDOERS_FILE="/etc/sudoers.d/$(printf 'llm-server-%s' "$(whoami)" | tr -c 'a-zA-Z0-9_' '-')"
 TEMPLATE_UNIT_DEST="/etc/systemd/system/llm-server@.service"
 LEGACY_UNIT="/etc/systemd/system/llm-server.service"
+# install.sh installs BOTH binaries to /usr/local/bin
 CTL_BIN_DEST="/usr/local/bin/llm-server-ctl"
+INDICATOR_BIN_DEST="/usr/local/bin/llm-server-indicator"
 
 echo "Uninstalling llm-server-indicator"
 
@@ -39,10 +42,12 @@ if command -v cargo >/dev/null 2>&1; then
     rm -f "$HOME/.cargo/bin/llm-server-ctl"
   fi
 fi
-if [[ -f "$CTL_BIN_DEST" ]]; then
-  sudo rm -f "$CTL_BIN_DEST"
-  echo "Removed $CTL_BIN_DEST"
-fi
+for bin in "$CTL_BIN_DEST" "$INDICATOR_BIN_DEST"; do
+  if [[ -f "$bin" ]]; then
+    sudo rm -f "$bin"
+    echo "Removed $bin"
+  fi
+done
 
 # Remove sudoers file
 if [[ -f "$SUDOERS_FILE" ]]; then
@@ -69,5 +74,8 @@ if [[ -f "$LEGACY_UNIT" ]]; then
 fi
 
 echo "Uninstall complete."
-# Note: Waybar integration is left in place on purpose.
-# Run scripts/install-waybar.sh manually if you want to update or remove it.
+# Note: the Waybar integration is NOT reverted by uninstall. To remove it,
+# delete ~/.config/waybar/modules/llm-server-module.json and
+# ~/.config/waybar/groups/group-llm.json, and edit ~/.config/waybar/config.jsonc
+# to drop the group include and the "group/llm" modules entry (or restore the
+# installer's backup at ~/.config/waybar/config.jsonc.bak).

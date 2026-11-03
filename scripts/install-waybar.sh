@@ -2,10 +2,12 @@
 set -euo pipefail
 
 # Waybar integration installer for llm-server-indicator (v2).
-# Installs the repo module file over the module file the Waybar config
-# imports (~/.config/waybar/modules/llm-server-module.json) and appends the
-# project style.css. The Waybar config itself is not modified: it already
-# imports the module file and lists "custom/llm-server" in modules-left.
+# Installs the repo module and group files (~/.config/waybar/modules/ and
+# ~/.config/waybar/groups/) and appends the project style.css. It also
+# patches the Waybar config (~/.config/waybar/config.jsonc) idempotently:
+# adds the group include next to the module include and lists "group/llm"
+# in a modules array in place of "custom/llm-server" — with a backup of the
+# config taken before the first in-place edit.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WAYBAR_DIR="$HOME/.config/waybar"
@@ -29,12 +31,25 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "[DRY-RUN] Would copy $MODULE_SRC to $MODULE_DEST"
   echo "[DRY-RUN] Would backup existing $GROUP_DEST (if present) to ${GROUP_DEST}.bak"
   echo "[DRY-RUN] Would copy $GROUP_SRC to $GROUP_DEST"
-  echo "[DRY-RUN] Would patch $WAYBAR_CONFIG (group include + modules entry, if needed)"
+  echo "[DRY-RUN] Would patch $WAYBAR_CONFIG (group include + modules entry, if needed; backed up to ${WAYBAR_CONFIG}.bak first)"
   exit 0
 fi
 
 echo "Installing Waybar integration for llm-server-indicator"
 echo "Project dir: $SCRIPT_DIR"
+
+# Back up the config once before the first in-place edit. If a .bak already
+# exists (e.g. from an earlier run), keep it untouched and stash the current
+# config under a timestamped name instead of clobbering it.
+backup_waybar_config() {
+  if [[ -f "${WAYBAR_CONFIG}.bak" ]]; then
+    cp "$WAYBAR_CONFIG" "${WAYBAR_CONFIG}.bak.$(date +%s)"
+    echo "Note: ${WAYBAR_CONFIG}.bak already exists - saved current config to ${WAYBAR_CONFIG}.bak.$(date +%s)"
+  else
+    cp "$WAYBAR_CONFIG" "${WAYBAR_CONFIG}.bak"
+    echo "Backed up $WAYBAR_CONFIG to ${WAYBAR_CONFIG}.bak"
+  fi
+}
 
 mkdir -p "$(dirname "$MODULE_DEST")"
 
@@ -71,15 +86,16 @@ if [[ ! -f "$WAYBAR_CONFIG" ]]; then
 else
   if ! grep -q "group-llm.json" "$WAYBAR_CONFIG"; then
     if grep -q "modules/llm-server-module.json" "$WAYBAR_CONFIG"; then
+      backup_waybar_config
       sed -i '/modules\/llm-server-module\.json/a\        "~/.config/waybar/groups/group-llm.json",' "$WAYBAR_CONFIG"
-      echo "Added group include to $WAYBAR_CONFIG"
+      echo "Added group include to $WAYBAR_CONFIG (backup: ${WAYBAR_CONFIG}.bak)"
     else
       echo "Warning: $WAYBAR_CONFIG does not import $MODULE_DEST."
       echo 'Add manually: "~/.config/waybar/groups/group-llm.json" to the "include" array.'
     fi
   fi
   if grep -q '"custom/llm-server"' "$WAYBAR_CONFIG"; then
-    cp "$WAYBAR_CONFIG" "${WAYBAR_CONFIG}.bak"
+    backup_waybar_config
     sed -i 's#"custom/llm-server"#"group/llm"#' "$WAYBAR_CONFIG"
     echo "Replaced \"custom/llm-server\" with \"group/llm\" in $WAYBAR_CONFIG (backup: ${WAYBAR_CONFIG}.bak)"
   elif ! grep -q '"group/llm"' "$WAYBAR_CONFIG"; then

@@ -1,14 +1,38 @@
 [Unit]
 Description=llama.cpp server: %i
-After=network-online.target
+# Cap the restart loop when run_setup exits non-zero (e.g. port conflict):
+# after 5 failed starts within 60 s the unit goes into the failed state.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/llm-server-ctl run %i
 Restart=on-failure
 RestartSec=3
+# Scrub proxy env: reqwest reads HTTP_PROXY/HTTPS_PROXY at runtime and a
+# stray proxy var would misroute loopback health polls.
+Environment=HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy=
+# --- Hardening (round 1 security audit) ---
+# The run path only reads the setups dir, binary, and model GGUFs (usually
+# under $HOME) and then exec()s; ProtectHome=read-only allows those reads
+# while blocking writes to /home, /root, and /run/user.
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHome=read-only
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+SystemCallFilter=@system-service
+# TasksMax intentionally left at the system default: llama-server sizes its thread pool to the core count, and a 64-task cap would break it on large machines; the NoNewPrivileges + sandbox block above already limits blast radius.
+# Deliberately NOT adding MemoryMax (model-sized, user-specific) or any
+# DeviceAllow/DevicePolicy restriction (llama-server needs GPU access via
+# Vulkan/CUDA; devices are left at the default policy).
 User=__INSTALL_USER__
 
 [Install]
