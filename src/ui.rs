@@ -7,12 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use egui::{CentralPanel, Color32, Context, RichText};
-use egui_winit::State;
 use once_cell::sync::Lazy;
 use std::time::Duration;
-use winit::event::{Event, WindowEvent};
-use winit::event_loop::EventLoopBuilder;
-use winit::window::WindowBuilder;
 
 use crate::config::{load_config, ServiceConfig};
 use crate::lock::ProcessLock;
@@ -54,7 +50,7 @@ struct App {
 }
 
 impl App {
-    fn new() -> Result<Self, String> {
+    fn load() -> Result<Self, String> {
         let cfg = load_config().map_err(|e| format!("Failed to load config: {}", e))?;
         let mut services = Vec::new();
         for (name, svc_cfg) in cfg.services {
@@ -193,37 +189,6 @@ impl App {
         svc.state = s;
         svc.healthy = h;
         res
-    }
-
-    /// Cheap fingerprint of everything the window renders, so `run_gui`
-    /// only requests a follow-up redraw when the visible state actually
-    /// changed (instead of redrawing at max FPS).
-    fn fingerprint(&self) -> String {
-        let mut f = String::new();
-        for svc in &self.services {
-            f.push_str(&format!("{:?}|{}|{}", svc.state, svc.healthy, svc.loading));
-        }
-        f.push('|');
-        f.push_str(&format!(
-            "{:?}{:?}{:?}|",
-            self.confirm_action, self.pending_action, self.selected_log_service
-        ));
-        // The log window's content changes when the background fetch lands
-        // in the cache, even though no App field does.
-        if let Some(name) = &self.selected_log_service {
-            if let Some(svc) = self.services.iter().find(|s| s.name == *name) {
-                let cache = logs_cache_lock();
-                f.push(if cache.contains_key(&svc.config.unit) {
-                    'c'
-                } else {
-                    ' '
-                });
-            }
-        }
-        if let Some(err) = &self.last_error {
-            f.push_str(err);
-        }
-        f
     }
 }
 
@@ -401,76 +366,47 @@ impl App {
     }
 }
 
+/// Runs the egui window via `eframe`, which owns the event loop, the
+/// OpenGL context, and the paint pass. The old hand-rolled loop created an
+/// `egui::Context` and fed it input but never rendered a frame, so the
+/// window never actually became visible.
+impl eframe::App for App {
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // Poll service state at most every 2 s and keep the window alive by
+        // scheduling the next repaint; user interaction repaints on its own.
+        if self.last_poll.elapsed() >= Duration::from_secs(2) {
+            self.poll();
+        }
+        self.ui(ctx);
+        ctx.request_repaint_after(Duration::from_secs(2));
+    }
+}
+
 pub fn run_gui() -> Result<(), String> {
-    let event_loop = EventLoopBuilder::<()>::with_user_event()
-        .build()
-        .map_err(|e| format!("Failed to create event loop: {}", e))?;
-    let window = WindowBuilder::new()
-        .with_title("LLM Server Indicator")
-        .build(&event_loop)
-        .map_err(|e| format!("Failed to create window: {}", e))?;
-    let egui_ctx = egui::Context::default();
-    let mut egui_state = State::new(
-        egui_ctx.clone(),
-        egui::ViewportId::ROOT,
-        &window,
-        Some(window.scale_factor() as f32),
-        None,
-    );
-    let mut app = App::new()?;
-    let mut last_poll = Instant::now();
-    let mut last_fingerprint = String::new();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("LLM Server Indicator")
+            .with_inner_size([720.0, 560.0]),
+        ..Default::default()
+    };
 
-    // winit 0.29 has no delayed redraw (request_redraw_at landed in 0.30),
-    // so a single timer thread wakes the event loop every 2 s via a user
-    // event; the NewEvents arm requests the redraw and the 2 s poll check
-    // below does the probing — still on the GUI thread.
-    let proxy = event_loop.create_proxy();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(2));
-        let _ = proxy.send_event(());
-    });
-
-    let _ = event_loop.run(move |event, _| match event {
-        Event::WindowEvent { event, .. } => {
-            let response = egui_state.on_window_event(&window, &event);
-            if response.repaint {
-                window.request_redraw();
-            }
-            if !response.consumed {
-                match event {
-                    WindowEvent::CloseRequested => {
-                        std::process::exit(0);
-                    }
-                    WindowEvent::RedrawRequested => {
-                        if last_poll.elapsed() >= Duration::from_secs(2) {
-                            app.poll();
-                            last_poll = Instant::now();
-                        }
-                        let raw_input = egui_state.take_egui_input(&window);
-                        let output = egui_ctx.run(raw_input, |ctx| {
-                            app.ui(ctx);
-                        });
-                        egui_state.handle_platform_output(&window, output.platform_output);
-                        // Redraw only when the visible state actually
-                        // changed since the last draw; the timer thread
-                        // above keeps the 2 s poll alive while idle.
-                        let fingerprint = app.fingerprint();
-                        if fingerprint != last_fingerprint {
-                            last_fingerprint = fingerprint;
-                            window.request_redraw();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Event::NewEvents(_) => {
-            window.request_redraw();
-        }
-        _ => {}
-    });
-    Ok(())
+    eframe::run_native(
+        "LLM Server Indicator",
+        options,
+        // Config errors are surfaced in the UI (via `last_error`) rather than
+        // aborting startup, so the user still sees the window.
+        Box::new(|_| {
+            Box::new(App::load().unwrap_or_else(|e| App {
+                services: Vec::new(),
+                last_poll: Instant::now(),
+                confirm_action: None,
+                pending_action: None,
+                selected_log_service: None,
+                last_error: Some(e),
+            }))
+        }),
+    )
+    .map_err(|e| format!("Failed to run GUI: {}", e))
 }
 
 #[cfg(test)]
