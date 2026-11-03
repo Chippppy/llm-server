@@ -1,4 +1,4 @@
-# llm-server-indicator
+# llm-server
 
 Run and swap multiple local llama.cpp servers (`llama-server`), each with its own model, launch flags, and port. The project provides:
 
@@ -7,16 +7,18 @@ Run and swap multiple local llama.cpp servers (`llama-server`), each with its ow
 - an egui GUI + system tray (`llm-server-indicator --gui`)
 - a Waybar module rendering aggregate status
 
-## Bundled setups
+## Sample setup templates
 
-The repo ships two commented templates in `setups/` — `muse.template.toml` and `qwen.template.toml` — each covering the full spec schema with placeholder paths and that model's tuned flag defaults. Copy one to `~/.config/llm-server-indicator/setups/<name>.toml` and fill in your real paths before use.
+The repo ships two fully commented templates in `setups/` that cover the entire spec schema with placeholder paths and per-model tuned flag defaults:
 
-| Setup | Model | Port | Group |
+| Template | Example model | Port | Notable tuned flags |
 |---|---|---|---|
-| `muse` | Muse-Glimmer 30B (`Q4_K_M` + DFlash draft) | 8080 | `default` |
-| `qwen` | Qwen 3.8 27B (`Q6_K` + DFlash2 draft) | 8080 | `default` |
+| `setups/muse.template.toml` | Muse-Glimmer 30B (`Q4_K_M` + DFlash draft) | 8080 | `temp`/`top_p`/`top_k` sampling |
+| `setups/qwen.template.toml` | Qwen 3.8 27B (`Q6_K` + DFlash2 draft) | 8080 | `q8_0` KV cache, medium reasoning effort |
 
-Both are in group `default`, so they are **exclusive**: activating one stops the other (stop-first, so two 20 GB+ models are never loaded into VRAM at once).
+They are **starting points, not ready-to-run specs** — copy one to `~/.config/llm-server-indicator/setups/<name>.toml` and fill in your real paths before use. `llm-server-ctl run` deliberately ignores `*.template.toml` files so an unfilled template can never be launched.
+
+If you install both samples as-is, they land on the same port in the same `group` (`default`), which makes them **exclusive**: activating one stops the other first — a sensible default when two large models can't sit in VRAM at once. Give each of your own setups its own port and group to run them in parallel.
 
 ## Architecture
 
@@ -180,11 +182,7 @@ Stops running `llm-server@*.service` instances, removes the template unit, `/usr
 
 ## Migrating from v1
 
-1. Run `scripts/install.sh` first (template unit + CLI must be in place).
-2. Preview: `./scripts/migrate_from_v1.sh --dry-run`
-3. Apply: `./scripts/migrate_from_v1.sh`
-
-The migration backs up `/etc/systemd/system/llm-server.service` to `/etc/systemd/system/llm-server.service.bak-v1`, stops and disables the legacy unit, removes the unit file, and reloads systemd. It is idempotent (safe to re-run) and never enables or starts any v2 unit.
+Existing users of the legacy single-server unit: after running `scripts/install.sh`, run `./scripts/migrate_from_v1.sh` (preview with `--dry-run`). It backs up `/etc/systemd/system/llm-server.service`, stops and disables it, removes the unit file, and reloads systemd. It is idempotent and never enables or starts any v2 unit.
 
 ## Waybar
 
@@ -197,7 +195,7 @@ The Waybar integration is a **drawer group** (`group/llm`) in the style of Wayba
   - left click opens the indicator GUI (`llm-server-indicator --gui`)
 - `waybar/group-llm.json` — the `group/llm` drawer (slides out on hover) plus two per-model buttons. Each button runs `llm-server-ctl status --service <name> --json` so it shows that model's live state, color-coded by state class.
 
-Per-model button gestures (the two bundled setups are one exclusive swap group, so toggling one on stops the other first):
+The bundled `group-llm.json` ships with two per-model buttons (`muse` and `qwen`) matching the sample templates above; rename them (and the `--service NAME` values) to match your own setups. Button gestures (services in the same exclusive group are stopped first when toggling a peer on):
 
 | Button | Left click | Right click |
 |---|---|---|
