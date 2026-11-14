@@ -11,7 +11,7 @@
 //! hermetic unit tests in `src/cli.rs`). `OnceLock` makes this parallel-safe:
 //! all tests in this process share the same fixture.
 
-use llm_server_indicator::config::{load_config, ServiceConfig};
+use llm_server_indicator::config::{ServiceConfig, load_config};
 use llm_server_indicator::service::{ServiceController, ServiceState};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -43,7 +43,9 @@ group = "default"
 "#,
             )
             .expect("failed to write fixture config");
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+            // SAFETY: test-only; `OnceLock` runs this closure exactly once
+            // per process, so no concurrent env mutation is possible.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
             dir
         })
         .path()

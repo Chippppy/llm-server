@@ -74,6 +74,20 @@ llm-server-ctl status --service qwen --json  # single-service JSON
 
 `llm-server-indicator` is the GUI binary but also delegates to the CLI: `llm-server-indicator --gui` opens the egui window, any other arguments behave like `llm-server-ctl`.
 
+## GUI
+
+`llm-server-indicator --gui` opens a single dark-themed window:
+
+- **Service cards** — status dot + state, display name, health badge, unit, and `Start`/`Stop`/`Toggle` (each action asks for confirmation, same exclusive-group semantics as the CLI).
+- **Context slider** (per service, template units only) — edits `flags.ctx_size` in `setups/<name>.toml` as you drag (comments and the rest of the file are preserved). Minimum is `6400`. The maximum is estimated from what fits in the GPU:
+
+  ```
+  max_ctx = (free_VRAM − 1 GiB safety − weights_on_GPU) ÷ KV_bytes_per_token
+  ```
+
+  `KV_bytes_per_token` comes from the model's GGUF metadata (full-attention layer count × KV heads × head size × `cache_type_k`/`v`), so hybrid models where only some layers keep a KV cache are estimated correctly. If `nvidia-smi` or the GGUF can't be read, the slider falls back to a generic `6400…131072` range with a note. The slider is **locked while the service is running** (the value only takes effect on the next start); the estimate refreshes automatically whenever a service changes state.
+- **Log panel** — resizable bottom panel inside the window (not a popout): pick a service, `Refresh`, and a monospace view of the last 200 `journalctl` lines, auto-scrolled to the newest line.
+
 ## Configuration
 
 ### Service config — `~/.config/llm-server-indicator/config.toml`

@@ -116,6 +116,18 @@ fn validate_setup_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Derive the setup name from a template unit name:
+/// `"llm-server@qwen.service"` → `"qwen"`. Returns `None` for units that do
+/// not follow the `llm-server@<name>.service` template (no setup file to
+/// adjust, hence no context control in the GUI).
+pub fn setup_name_from_unit(unit: &str) -> Option<String> {
+    let inner = unit.strip_prefix("llm-server@")?.strip_suffix(".service")?;
+    if inner.is_empty() || inner.contains('@') {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
 /// Load and validate `setups/<name>.toml` from the default setups dir.
 pub fn load_setup(name: &str) -> Result<SetupSpec, String> {
     load_setup_from(&setups_dir(), name)
@@ -864,6 +876,22 @@ main = "/models/x.gguf"
     }
 
     #[test]
+    fn test_setup_name_from_unit() {
+        assert_eq!(
+            setup_name_from_unit("llm-server@qwen.service"),
+            Some("qwen".into())
+        );
+        assert_eq!(
+            setup_name_from_unit("llm-server@muse.service"),
+            Some("muse".into())
+        );
+        assert_eq!(setup_name_from_unit("other.service"), None);
+        assert_eq!(setup_name_from_unit("llm-server@qwen"), None);
+        assert_eq!(setup_name_from_unit("llm-server@.service"), None);
+        assert_eq!(setup_name_from_unit("llm-server@a@b.service"), None);
+    }
+
+    #[test]
     fn test_load_setup_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let main = dir.path().join("model.gguf");
@@ -939,7 +967,12 @@ extra_args = []
         )
         .unwrap();
         let _guard = SETUPS_DIR_LOCK.lock().unwrap();
-        std::env::set_var("LLM_SERVER_INDICATOR_SETUPS_DIR", dir.path());
+        // SAFETY: test-only; env writers in this binary all hold
+        // `ENV_MUTEX`, so no concurrent env mutation is possible.
+        let _env = crate::test_support::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("LLM_SERVER_INDICATOR_SETUPS_DIR", dir.path()) };
         let path = setups_dir().join("muse.toml");
         assert!(
             path.starts_with(dir.path()),
@@ -1013,7 +1046,12 @@ extra_args = ["-np", "1", "--no-reasoning-preserve", "--chat-template-kwargs", "
         )
         .unwrap();
         let _guard = SETUPS_DIR_LOCK.lock().unwrap();
-        std::env::set_var("LLM_SERVER_INDICATOR_SETUPS_DIR", dir.path());
+        // SAFETY: test-only; env writers in this binary all hold
+        // `ENV_MUTEX`, so no concurrent env mutation is possible.
+        let _env = crate::test_support::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("LLM_SERVER_INDICATOR_SETUPS_DIR", dir.path()) };
         let path = setups_dir().join("qwen.toml");
         assert!(
             path.starts_with(dir.path()),

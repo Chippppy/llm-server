@@ -1,18 +1,20 @@
 //! UI module using egui
-//! Provides a GUI window with service list, status, controls, and logs.
+//! Provides a GUI window with a service list, per-service context-window
+//! control, start/stop controls, and an in-window log panel.
 
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use egui::{CentralPanel, Color32, Context, RichText};
+use egui::{Color32, Context, RichText, Ui};
 use once_cell::sync::Lazy;
-use std::time::Duration;
 
 use crate::config::{load_config, ServiceConfig};
 use crate::lock::ProcessLock;
+use crate::run;
 use crate::service::{ServiceController, ServiceState};
+use crate::vram;
 
 static LOGS_CACHE: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -36,6 +38,16 @@ struct ServiceInfo {
     state: ServiceState,
     healthy: bool,
     loading: bool,
+    /// Setup name derived from the unit (`llm-server@<name>.service`).
+    /// `None` means the unit is not a template unit — no setup file, hence
+    /// no context control for this service.
+    setup_name: Option<String>,
+    /// Currently configured `ctx_size` from the setup file.
+    ctx_value: Option<u32>,
+    /// VRAM-derived maximum context, refreshed on load and on state changes.
+    ctx_estimate: Option<vram::CtxEstimate>,
+    /// Non-fatal note about the estimate (setup file problem, fallback).
+    ctx_note: Option<String>,
 }
 
 struct App {
@@ -47,6 +59,8 @@ struct App {
     /// Last failed action's error, shown above the service list (cleared on
     /// the next successful action).
     last_error: Option<String>,
+    /// Free GPU VRAM (GiB display helper) from the last estimate refresh.
+    gpu_free_mib: Option<u64>,
 }
 
 impl App {
@@ -56,6 +70,13 @@ impl App {
         for (name, svc_cfg) in cfg.services {
             let controller = ServiceController::new(svc_cfg.clone(), None);
             let (state, healthy) = controller.combined_state();
+            let (setup_name, ctx_value, ctx_note) = match run::setup_name_from_unit(&svc_cfg.unit) {
+                Some(setup) => match vram::load_spec_raw(&setup) {
+                    Ok(spec) => (Some(setup), spec.flags.ctx_size, None),
+                    Err(e) => (Some(setup), None, Some(format!("setup file: {e}"))),
+                },
+                None => (None, None, None),
+            };
             services.push(ServiceInfo {
                 name,
                 config: svc_cfg,
@@ -63,19 +84,36 @@ impl App {
                 state,
                 healthy,
                 loading: false,
+                setup_name,
+                ctx_value,
+                ctx_estimate: None,
+                ctx_note,
             });
         }
-        Ok(Self {
+        let mut app = Self {
             services,
             last_poll: Instant::now(),
             confirm_action: None,
             pending_action: None,
             selected_log_service: None,
             last_error: None,
-        })
+            gpu_free_mib: None,
+        };
+        app.selected_log_service = app.services.first().map(|s| s.name.clone());
+        app.recompute_estimates();
+        if let Some(unit) = app.selected_log_service.as_ref().and_then(|n| {
+            app.services
+                .iter()
+                .find(|s| &s.name == n)
+                .map(|s| s.config.unit.clone())
+        }) {
+            Self::fetch_logs_async(&unit);
+        }
+        Ok(app)
     }
 
     fn poll(&mut self) {
+        let mut changed = false;
         for svc in &mut self.services {
             let prev_state = svc.state.clone();
             let (s, h) = svc.controller.combined_state();
@@ -83,12 +121,44 @@ impl App {
             svc.healthy = h;
 
             if prev_state != svc.state {
+                changed = true;
                 let title = "Service state changed";
                 let body = format!("{} is now {:?}", svc.config.display_name, svc.state);
                 svc.controller.notify(title, &body);
             }
         }
+        // VRAM changed under us: refresh the context estimates (one
+        // nvidia-smi call + GGUF header reads, only on transitions).
+        if changed {
+            self.recompute_estimates();
+        }
         self.last_poll = Instant::now();
+    }
+
+    /// Re-read free VRAM and refresh the context estimate of every service
+    /// that has a setup file.
+    fn recompute_estimates(&mut self) {
+        let free = vram::query_free_vram_mib().ok();
+        self.gpu_free_mib = free;
+        for svc in &mut self.services {
+            let Some(setup) = &svc.setup_name else {
+                continue;
+            };
+            match vram::estimate_for_setup(setup, free) {
+                Ok(est) => {
+                    svc.ctx_note = if est.warnings.is_empty() {
+                        None
+                    } else {
+                        Some(est.warnings.join("; "))
+                    };
+                    svc.ctx_estimate = Some(est);
+                }
+                Err(e) => {
+                    svc.ctx_estimate = None;
+                    svc.ctx_note = Some(e);
+                }
+            }
+        }
     }
 
     fn perform_action(&mut self, action: &ConfirmAction) -> Result<(), String> {
@@ -190,6 +260,16 @@ impl App {
         svc.healthy = h;
         res
     }
+
+    /// Fetch `journalctl` for a unit in a background thread and store the
+    /// result in the log cache.
+    fn fetch_logs_async(unit: &str) {
+        let unit = unit.to_string();
+        std::thread::spawn(move || {
+            let logs = fetch_logs_static(&unit);
+            logs_cache_lock().insert(unit, logs);
+        });
+    }
 }
 
 fn state_color(state: &ServiceState, healthy: bool) -> Color32 {
@@ -218,6 +298,19 @@ fn state_label(state: &ServiceState) -> &'static str {
     }
 }
 
+/// Format a number with thousands separators (Rust's `format!` has no `,`).
+fn thousands(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn fetch_logs_static(unit: &str) -> String {
     let output = Command::new("journalctl")
         .args(["-u", unit, "-n", "200", "--no-pager"])
@@ -238,55 +331,38 @@ impl App {
             }
         }
 
-        CentralPanel::default().show(ctx, |ui| {
-            ui.heading("LLM Server Indicator");
+        // Logs live in a resizable bottom panel inside the main window —
+        // shown first so it reserves its space before the central panel.
+        egui::TopBottomPanel::bottom("log_panel")
+            .default_height(240.0)
+            .min_height(120.0)
+            .resizable(true)
+            .show(ctx, |ui| self.log_panel(ui));
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("LLM Server Indicator");
+                if let Some(free) = self.gpu_free_mib {
+                    ui.label(
+                        RichText::new(format!("GPU free {:.1} GiB", free as f64 / 1024.0))
+                            .weak()
+                            .small(),
+                    );
+                }
+            });
             if let Some(err) = &self.last_error {
-                ui.colored_label(Color32::from_rgb(255, 0, 0), format!("Error: {}", err));
+                ui.colored_label(
+                    Color32::from_rgb(255, 90, 90),
+                    RichText::new(format!("Error: {err}")).small(),
+                );
                 ui.separator();
             }
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for svc in &mut self.services {
-                    let color = state_color(&svc.state, svc.healthy);
-                    let label = state_label(&svc.state);
-                    let name = svc.name.clone();
-                    let display_name = svc.config.display_name.clone();
-                    let unit = svc.config.unit.clone();
-                    let loading = svc.loading;
-                    let healthy = svc.healthy;
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(color, RichText::new(label).strong());
-                            ui.label(&display_name);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if loading {
-                                        ui.spinner();
-                                    }
-                                    if ui.button("Logs").clicked() {
-                                        // defer log fetch to next frame
-                                        self.selected_log_service = Some(name.clone());
-                                    }
-                                },
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.button("Start").clicked() {
-                                self.confirm_action = Some(ConfirmAction::Start(name.clone()));
-                            }
-                            if ui.button("Stop").clicked() {
-                                self.confirm_action = Some(ConfirmAction::Stop(name.clone()));
-                            }
-                            if ui.button("Toggle").clicked() {
-                                self.confirm_action = Some(ConfirmAction::Toggle(name.clone()));
-                            }
-                            ui.label(format!("Unit: {}", unit));
-                        });
-                        ui.label(format!("Health: {}", if healthy { "OK" } else { "FAIL" }));
-                    });
-                    ui.add_space(8.0);
+                    Self::service_card(ui, svc, &mut self.confirm_action, &mut self.last_error);
+                    ui.add_space(10.0);
                 }
             });
         });
@@ -317,59 +393,219 @@ impl App {
                     });
                 });
         }
+    }
 
-        // Log window
-        if let Some(name) = self.selected_log_service.clone() {
-            // Ensure logs are being fetched (non-blocking)
-            if let Some(svc) = self.services.iter().find(|s| s.name == name) {
-                // Trigger async fetch if not cached
-                let unit = svc.config.unit.clone();
-                let cache = logs_cache_lock();
-                let cached = cache.get(&unit).cloned();
-                drop(cache);
-                if cached.is_none() {
-                    // Spawn fetch in background
-                    let unit_clone = unit.clone();
-                    std::thread::spawn(move || {
-                        let logs = fetch_logs_static(&unit_clone);
-                        let mut cache = logs_cache_lock();
-                        cache.insert(unit_clone, logs);
+    /// One service card: status, unit, context-window slider, and controls.
+    fn service_card(
+        ui: &mut Ui,
+        svc: &mut ServiceInfo,
+        confirm_action: &mut Option<ConfirmAction>,
+        last_error: &mut Option<String>,
+    ) {
+        let color = state_color(&svc.state, svc.healthy);
+        egui::Frame::group(ui.style())
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                // Title row: status dot + label + name, health badge right-aligned
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, RichText::new("●").strong());
+                    ui.colored_label(
+                        color,
+                        RichText::new(state_label(&svc.state)).strong().size(15.0),
+                    );
+                    ui.label(RichText::new(&svc.config.display_name).size(15.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if svc.loading {
+                            ui.spinner();
+                        }
+                        let (text, c) = if svc.healthy {
+                            ("health ok", Color32::from_rgb(130, 220, 130))
+                        } else {
+                            ("health fail", Color32::from_rgb(255, 130, 130))
+                        };
+                        ui.label(RichText::new(text).small().color(c));
                     });
-                }
-                let mut log_text = cached.unwrap_or_else(|| "Loading logs...".to_string());
-                let mut open = true;
-                egui::Window::new(format!("Logs for {}", name))
-                    .open(&mut open)
-                    .show(ctx, |ui| {
-                        ui.text_edit_multiline(&mut log_text);
-                        if ui.button("Refresh").clicked() {
-                            // Invalidate cache and refetch
-                            {
-                                let mut cache = logs_cache_lock();
-                                cache.remove(&unit);
-                            }
-                            // Trigger new fetch
-                            let unit_clone = unit.clone();
-                            std::thread::spawn(move || {
-                                let logs = fetch_logs_static(&unit_clone);
-                                let mut cache = logs_cache_lock();
-                                cache.insert(unit_clone, logs);
-                            });
-                            log_text = "Loading logs...".to_string();
+                });
+                ui.label(
+                    RichText::new(format!("unit {}", svc.config.unit))
+                        .small()
+                        .weak(),
+                );
+
+                // --- Context-window slider ---
+                let setup = svc.setup_name.clone();
+                // Locked while the model occupies (or is taking) VRAM: the value
+                // only takes effect on the next start anyway.
+                let locked = matches!(
+                    svc.state,
+                    ServiceState::Active
+                        | ServiceState::Loading
+                        | ServiceState::Activating
+                        | ServiceState::Unhealthy
+                );
+                if let Some(setup_name) = setup {
+                    let est = svc.ctx_estimate.clone();
+                    let max = est
+                        .as_ref()
+                        .map(|e| e.max_ctx.max(vram::MIN_CTX))
+                        .unwrap_or(vram::FALLBACK_MAX_CTX);
+                    let before = svc
+                        .ctx_value
+                        .unwrap_or(vram::MIN_CTX)
+                        .clamp(vram::MIN_CTX, max);
+                    let mut val = before;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("context").strong());
+                        ui.add(egui::Slider::new(&mut val, vram::MIN_CTX..=max).text("ctx"));
+                        ui.label(RichText::new(thousands(val)).monospace().strong());
+                        if locked {
+                            ui.label(RichText::new("locked while running").weak().small());
                         }
                     });
-                if !open {
-                    self.selected_log_service = None;
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        match &est {
+                            Some(e) if e.estimated => {
+                                ui.label(
+                                    RichText::new(format!(
+                                    "max ≈ {}  (free {:.1} GiB − 1 GiB safety − {:.1} GiB weights)",
+                                    thousands(e.max_ctx),
+                                    e.free_vram_mib.unwrap_or(0) as f64 / 1024.0,
+                                    e.weights_on_gpu_mib as f64 / 1024.0
+                                ))
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            Some(_) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "max {} (generic estimate)",
+                                        thousands(max)
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new(format!("max {}", thousands(max)))
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                        }
+                        if let Some(note) = &svc.ctx_note {
+                            ui.label(
+                                RichText::new(note)
+                                    .small()
+                                    .color(Color32::from_rgb(255, 180, 80)),
+                            );
+                        }
+                    });
+                    if val != before && !locked {
+                        match vram::update_ctx_size(&setup_name, val) {
+                            Ok(()) => svc.ctx_value = Some(val),
+                            Err(e) => {
+                                *last_error =
+                                    Some(format!("Failed to save context {}: {e}", thousands(val)))
+                            }
+                        }
+                    }
                 }
+
+                // --- Controls ---
+                ui.horizontal(|ui| {
+                    let name = svc.name.clone();
+                    if ui.button("Start").clicked() {
+                        *confirm_action = Some(ConfirmAction::Start(name.clone()));
+                    }
+                    if ui.button("Stop").clicked() {
+                        *confirm_action = Some(ConfirmAction::Stop(name.clone()));
+                    }
+                    if ui.button("Toggle").clicked() {
+                        *confirm_action = Some(ConfirmAction::Toggle(name));
+                    }
+                });
+            });
+    }
+
+    /// In-window log panel: service picker, refresh, and a monospace view of
+    /// the selected service's journal.
+    fn log_panel(&mut self, ui: &mut Ui) {
+        let options: Vec<(String, String)> = self
+            .services
+            .iter()
+            .map(|s| (s.name.clone(), s.config.display_name.clone()))
+            .collect();
+        let current = self.selected_log_service.clone();
+        let current_display = options
+            .iter()
+            .find(|(n, _)| Some(n) == current.as_ref())
+            .map(|(_, d)| d.clone());
+
+        let mut picked: Option<String> = None;
+        let mut refresh = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Logs").strong());
+            if let Some(label) = current_display {
+                egui::ComboBox::new("log_service", label).show_ui(ui, |ui| {
+                    for (name, display) in &options {
+                        if ui
+                            .selectable_label(Some(name) == current.as_ref(), display)
+                            .clicked()
+                        {
+                            picked = Some(name.clone());
+                            ui.close_menu();
+                        }
+                    }
+                });
+            }
+            if ui.button("Refresh").clicked() {
+                refresh = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new("journalctl, last 200 lines").weak().small());
+            });
+        });
+        if let Some(name) = picked {
+            self.selected_log_service = Some(name);
+        }
+
+        let unit: Option<String> = self
+            .selected_log_service
+            .as_ref()
+            .and_then(|n| self.services.iter().find(|s| &s.name == n))
+            .map(|s| s.config.unit.clone());
+
+        if refresh {
+            if let Some(u) = &unit {
+                logs_cache_lock().remove(u);
+                Self::fetch_logs_async(u);
             }
         }
+
+        ui.separator();
+        let text = match &unit {
+            Some(u) => match logs_cache_lock().get(u).cloned() {
+                Some(t) => t,
+                None => {
+                    Self::fetch_logs_async(u);
+                    "Loading logs…".to_string()
+                }
+            },
+            None => "No service selected".to_string(),
+        };
+        egui::ScrollArea::both()
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                ui.label(RichText::new(text).monospace().size(11.5));
+            });
     }
 }
 
 /// Runs the egui window via `eframe`, which owns the event loop, the
-/// OpenGL context, and the paint pass. The old hand-rolled loop created an
-/// `egui::Context` and fed it input but never rendered a frame, so the
-/// window never actually became visible.
+/// OpenGL context, and the paint pass.
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         // Poll service state at most every 2 s and keep the window alive by
@@ -386,7 +622,10 @@ pub fn run_gui() -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("LLM Server Indicator")
-            .with_inner_size([720.0, 560.0]),
+            .with_inner_size([820.0, 700.0]),
+        // System theme detection is unreliable on Linux; keep the dark theme.
+        follow_system_theme: false,
+        default_theme: eframe::Theme::Dark,
         ..Default::default()
     };
 
@@ -403,6 +642,7 @@ pub fn run_gui() -> Result<(), String> {
                 pending_action: None,
                 selected_log_service: None,
                 last_error: Some(e),
+                gpu_free_mib: None,
             }))
         }),
     )

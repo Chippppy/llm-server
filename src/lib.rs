@@ -7,6 +7,7 @@ pub mod lock;
 pub mod run;
 pub mod service;
 pub mod ui;
+pub mod vram;
 
 /// Shared helpers for tests that mutate process-wide state (env vars).
 #[cfg(test)]
@@ -25,14 +26,17 @@ pub mod test_support {
 
     impl EnvSetGuard {
         pub fn set(key: &'static str, value: &std::path::Path) -> Self {
-            std::env::set_var(key, value);
+            // SAFETY: test-only; the shared `ENV_MUTEX` serializes env
+            // mutation across test threads.
+            unsafe { std::env::set_var(key, value) };
             Self { key }
         }
     }
 
     impl Drop for EnvSetGuard {
         fn drop(&mut self) {
-            std::env::remove_var(self.key);
+            // SAFETY: test-only; holds `ENV_MUTEX` via the owning test.
+            unsafe { std::env::remove_var(self.key) };
         }
     }
 }
