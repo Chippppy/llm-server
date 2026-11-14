@@ -1,6 +1,6 @@
 [package]
 name = "llm-server-indicator"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Run and swap multiple local llama.cpp (llama-server) servers with a CLI, systemd template units, an egui GUI, and a Waybar module"
 repository = "https://github.com/Chippppy/llm-server"

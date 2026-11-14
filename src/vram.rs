@@ -15,12 +15,17 @@
 //! where only every Nth layer is full attention — counting all blocks would
 //! overestimate the per-token cost many times over.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
-use crate::run::{setups_dir, SetupSpec};
+use once_cell::sync::Lazy;
+
+use crate::run::{SetupSpec, setups_dir};
 
 /// VRAM kept aside (beyond model weights + KV cache) for the CUDA context,
 /// compute buffers, and the desktop compositor.
@@ -135,6 +140,36 @@ pub fn read_gguf_info(path: &Path) -> Result<GgufInfo, String> {
     let file =
         fs::File::open(path).map_err(|e| format!("cannot open {}: {}", path.display(), e))?;
     parse_gguf_info(file)
+}
+
+/// Parsed GGUF headers, keyed by path with the file's mtime at parse time.
+/// Parsing a real model header takes ~0.7 s (the tokenizer arrays are
+/// hundreds of thousands of small elements, one read each) — the GUI polls
+/// every couple of seconds, so re-parsing the same file each time froze the
+/// window. Model metadata is immutable in practice; a changed mtime
+/// invalidates the entry.
+static GGUF_INFO_CACHE: Lazy<Mutex<HashMap<String, (SystemTime, GgufInfo)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// [`read_gguf_info`] with caching: returns the cached parse when the file's
+/// mtime is unchanged.
+pub fn read_gguf_info_cached(path: &Path) -> Result<GgufInfo, String> {
+    let mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    let key = path.to_string_lossy().into_owned();
+    if let Some(m) = &mtime {
+        let cache = GGUF_INFO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, info)) = cache.get(&key).filter(|(t, _)| t == m) {
+            return Ok(info.clone());
+        }
+    }
+    let info = read_gguf_info(path)?;
+    if let Some(m) = mtime {
+        GGUF_INFO_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (m, info.clone()));
+    }
+    Ok(info)
 }
 
 fn read_into<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), String> {
@@ -449,7 +484,7 @@ pub fn estimate_for_setup(setup: &str, free_vram_mib: Option<u64>) -> Result<Ctx
     };
 
     // --- main model: metadata + weight size ---
-    let main_info = match read_gguf_info(Path::new(&spec.model.main)) {
+    let main_info = match read_gguf_info_cached(Path::new(&spec.model.main)) {
         Ok(i) => Some(i),
         Err(e) => {
             warnings.push(format!("main model metadata: {e}"));
@@ -473,7 +508,7 @@ pub fn estimate_for_setup(setup: &str, free_vram_mib: Option<u64>) -> Result<Ctx
         .model
         .draft
         .as_ref()
-        .and_then(|d| read_gguf_info(Path::new(d)).ok())
+        .and_then(|d| read_gguf_info_cached(Path::new(d)).ok())
         .and_then(|i| i.block_count)
         .map(|blocks| offload_ratio(spec.flags.ngld, Some(blocks)))
         .unwrap_or_else(|| offload_ratio(spec.flags.ngld, None));
@@ -619,8 +654,15 @@ pub fn update_ctx_size(setup: &str, ctx: u32) -> Result<(), String> {
             path.display()
         ));
     }
-    fs::write(&path, new_content)
-        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+    // Atomic replace (write temp + rename): the GUI's background estimate
+    // thread may be reading the file while the slider saves a new value, and
+    // a plain truncate-in-place write could hand it a torn file.
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, &new_content).map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to replace {}: {e}", path.display())
+    })?;
     Ok(())
 }
 
@@ -665,8 +707,8 @@ mod tests {
         v
     }
 
-    fn llama_info() -> GgufInfo {
-        let bytes = gguf(&[
+    fn llama_info_bytes() -> Vec<u8> {
+        gguf(&[
             ("general.architecture", 8, str_body("llama")),
             ("llama.block_count", 4, u32_body(32)),
             ("llama.attention.head_count", 4, u32_body(32)),
@@ -675,7 +717,11 @@ mod tests {
             ("llama.attention.value_length", 4, u32_body(128)),
             // unrelated key with a string value: must be skipped cleanly
             ("general.name", 8, str_body("Test Model")),
-        ]);
+        ])
+    }
+
+    fn llama_info() -> GgufInfo {
+        let bytes = llama_info_bytes();
         parse_gguf_info(&bytes[..]).unwrap()
     }
 
@@ -689,6 +735,29 @@ mod tests {
         assert_eq!(info.key_length, Some(128));
         assert_eq!(info.value_length, Some(128));
         assert_eq!(info.recurrent_layers, None);
+    }
+
+    #[test]
+    fn test_read_gguf_info_cached_hits_and_invalidates_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.gguf");
+        fs::write(&path, llama_info_bytes()).unwrap();
+        let first = read_gguf_info_cached(&path).unwrap();
+        // Same mtime → cache hit, identical result.
+        let second = read_gguf_info_cached(&path).unwrap();
+        assert_eq!(first, second);
+        // Rewrite with block_count 32 → 24 (new mtime) → reparse must win.
+        let key = b"llama.block_count";
+        let mut changed = llama_info_bytes();
+        let key_pos = changed
+            .windows(key.len())
+            .position(|w| w == key)
+            .expect("block_count key in fixture");
+        let val_pos = key_pos + key.len() + 4; // key bytes + vtype u32
+        changed[val_pos..val_pos + 4].copy_from_slice(&24u32.to_le_bytes());
+        fs::write(&path, changed).unwrap();
+        let third = read_gguf_info_cached(&path).unwrap();
+        assert_eq!(third.block_count, Some(24));
     }
 
     #[test]
@@ -957,6 +1026,32 @@ jinja = true
             let spec: SetupSpec = toml::from_str(&out).unwrap();
             assert_eq!(spec.flags.ctx_size, Some(8192));
         });
+    }
+
+    /// Time one GGUF header parse (the cost the GUI used to pay per poll):
+    /// `cargo test vram::tests::bench_gguf_header_parse -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_gguf_header_parse() {
+        let path = Path::new("/home/arido/Documents/hf-models/qwen-3.8/Qwen3.8-27B-Q6_K.gguf");
+        if !path.exists() {
+            eprintln!("model not present, skipping");
+            return;
+        }
+        let start = std::time::Instant::now();
+        let info = read_gguf_info(path).unwrap();
+        let cold = start.elapsed();
+        let _ = read_gguf_info_cached(path).unwrap(); // cold: populates the cache
+        let start = std::time::Instant::now();
+        let info2 = read_gguf_info_cached(path).unwrap();
+        let cached = start.elapsed();
+        assert_eq!(info, info2);
+        println!(
+            "cold parse: {:.2?} | cached read: {:.2?} (kv_bytes/token f16: {:?})",
+            cold,
+            cached,
+            kv_bytes_per_token(&info, 2.0, 2.0)
+        );
     }
 
     /// Manual sanity check against the real setups on this machine:

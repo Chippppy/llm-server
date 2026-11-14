@@ -50,6 +50,14 @@ struct ServiceInfo {
     ctx_note: Option<String>,
 }
 
+/// Result of one background VRAM/estimate refresh, delivered to the UI
+/// thread via an mpsc channel (never blocking).
+struct EstimatesBatch {
+    free: Option<u64>,
+    /// One entry per service that has a setup file, keyed by setup name.
+    results: Vec<(String, Result<vram::CtxEstimate, String>)>,
+}
+
 struct App {
     services: Vec<ServiceInfo>,
     last_poll: Instant,
@@ -61,6 +69,11 @@ struct App {
     last_error: Option<String>,
     /// Free GPU VRAM (GiB display helper) from the last estimate refresh.
     gpu_free_mib: Option<u64>,
+    /// In-flight VRAM/estimate refresh results, applied on the next frame.
+    estimates_rx: std::sync::mpsc::Receiver<EstimatesBatch>,
+    /// True while a background estimate refresh is running (prevents
+    /// pile-up of threads when Refresh is mashed).
+    estimating: bool,
 }
 
 impl App {
@@ -90,6 +103,7 @@ impl App {
                 ctx_note,
             });
         }
+        let (_tx, estimates_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             services,
             last_poll: Instant::now(),
@@ -98,9 +112,14 @@ impl App {
             selected_log_service: None,
             last_error: None,
             gpu_free_mib: None,
+            estimates_rx,
+            estimating: false,
         };
         app.selected_log_service = app.services.first().map(|s| s.name.clone());
-        app.recompute_estimates();
+        // First estimate runs in the background too: parsing a real model
+        // header takes ~0.7 s, which we don't want on top of window startup.
+        // The slider shows the fallback max until the batch lands.
+        app.spawn_estimate_refresh();
         if let Some(unit) = app.selected_log_service.as_ref().and_then(|n| {
             app.services
                 .iter()
@@ -129,35 +148,86 @@ impl App {
         // changes: free VRAM moves without a state transition (a stopped
         // model releases its VRAM a few seconds *after* the state flips
         // to Inactive, other GPU processes come and go), and the slider
-        // max + "GPU free" readout must track that. One nvidia-smi call
-        // plus small GGUF header reads per poll.
-        self.recompute_estimates();
+        // max + "GPU free" readout must track that.
+        self.spawn_estimate_refresh();
         self.last_poll = Instant::now();
     }
 
-    /// Re-read free VRAM and refresh the context estimate of every service
-    /// that has a setup file.
-    fn recompute_estimates(&mut self) {
-        let free = vram::query_free_vram_mib().ok();
-        self.gpu_free_mib = free;
-        for svc in &mut self.services {
-            let Some(setup) = &svc.setup_name else {
+    /// Re-read free VRAM and refresh the context estimates off the UI
+    /// thread: nvidia-smi plus the setup TOML/GGUF reads must not block the
+    /// window (a real GGUF header parse alone is ~0.7 s). Results are
+    /// delivered via [`App::estimates_rx`] and applied on the next frame.
+    fn spawn_estimate_refresh(&mut self) {
+        if self.estimating {
+            return;
+        }
+        let setups: Vec<String> = self
+            .services
+            .iter()
+            .filter_map(|s| s.setup_name.clone())
+            .collect();
+        if setups.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.estimates_rx = rx;
+        self.estimating = true;
+        std::thread::spawn(move || {
+            let free = vram::query_free_vram_mib().ok();
+            let mut results = Vec::new();
+            for setup in &setups {
+                results.push((setup.clone(), vram::estimate_for_setup(setup, free)));
+            }
+            let _ = tx.send(EstimatesBatch { free, results });
+        });
+    }
+
+    /// Apply a finished background estimate batch to the services.
+    fn apply_estimates(&mut self, batch: EstimatesBatch) {
+        self.gpu_free_mib = batch.free;
+        for (setup, res) in &batch.results {
+            let Some(svc) = self
+                .services
+                .iter_mut()
+                .find(|s| s.setup_name.as_deref() == Some(setup.as_str()))
+            else {
                 continue;
             };
-            match vram::estimate_for_setup(setup, free) {
+            match res {
                 Ok(est) => {
                     svc.ctx_note = if est.warnings.is_empty() {
                         None
                     } else {
                         Some(est.warnings.join("; "))
                     };
-                    svc.ctx_estimate = Some(est);
+                    svc.ctx_estimate = Some(est.clone());
                 }
                 Err(e) => {
                     svc.ctx_estimate = None;
-                    svc.ctx_note = Some(e);
+                    svc.ctx_note = Some(e.clone());
                 }
             }
+        }
+    }
+
+    /// Drain finished background estimate batches (non-blocking) and clear
+    /// the in-flight flag when the worker has finished.
+    fn drain_estimates(&mut self) {
+        let mut landed = false;
+        while let Ok(batch) = self.estimates_rx.try_recv() {
+            self.apply_estimates(batch);
+            landed = true;
+        }
+        // The worker is done if a batch landed, or the channel is closed
+        // (its sender dropped: the thread finished — or panicked before
+        // sending, in which case the next poll simply re-spawns it).
+        if landed
+            || matches!(
+                self.estimates_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            )
+        {
+            self.estimating = false;
         }
     }
 
@@ -323,6 +393,9 @@ fn fetch_logs_static(unit: &str) -> String {
 
 impl App {
     fn ui(&mut self, ctx: &Context) {
+        // Apply VRAM/estimate results computed on the background thread.
+        self.drain_estimates();
+
         // Process pending action
         if let Some(action) = self.pending_action.take() {
             match self.perform_action(&action) {
@@ -644,6 +717,7 @@ pub fn run_gui() -> Result<(), String> {
         // Config errors are surfaced in the UI (via `last_error`) rather than
         // aborting startup, so the user still sees the window.
         Box::new(|_| {
+            let (_tx, estimates_rx) = std::sync::mpsc::channel();
             Box::new(App::load().unwrap_or_else(|e| App {
                 services: Vec::new(),
                 last_poll: Instant::now(),
@@ -652,6 +726,8 @@ pub fn run_gui() -> Result<(), String> {
                 selected_log_service: None,
                 last_error: Some(e),
                 gpu_free_mib: None,
+                estimates_rx,
+                estimating: false,
             }))
         }),
     )
