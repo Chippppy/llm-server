@@ -78,7 +78,7 @@ llm-server-ctl status --service qwen --json  # single-service JSON
 
 `llm-server-indicator --gui` opens a single dark-themed window:
 
-- **Service cards** — status dot + state, display name, health badge, unit, and `Start`/`Stop`/`Toggle` (each action asks for confirmation, same exclusive-group semantics as the CLI).
+- **Service cards** — status dot + state, display name, health badge, unit, and `Start`/`Stop`/`Toggle` (each action asks for confirmation, same exclusive-group semantics as the CLI). The **Parallel** checkbox in the header switches the window to multi-model mode: starting a service no longer auto-stops the other running services of its group. Default (unchecked) keeps the VRAM-safe exclusive swap. Models whose setups share a port still cannot run at the same time — the confirm dialog warns about that before the start.
 - **Context slider** (per service, template units only) — edits `flags.ctx_size` in `setups/<name>.toml` as you drag (comments and the rest of the file are preserved). Minimum is `6400`. The maximum is estimated from what fits in the GPU:
 
   ```

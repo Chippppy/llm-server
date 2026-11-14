@@ -48,6 +48,9 @@ struct ServiceInfo {
     ctx_estimate: Option<vram::CtxEstimate>,
     /// Non-fatal note about the estimate (setup file problem, fallback).
     ctx_note: Option<String>,
+    /// Port from the setup spec (for same-port conflict warnings in
+    /// parallel mode; `None` when there is no setup file).
+    port: Option<u16>,
 }
 
 /// Result of one background VRAM/estimate refresh, delivered to the UI
@@ -74,6 +77,10 @@ struct App {
     /// True while a background estimate refresh is running (prevents
     /// pile-up of threads when Refresh is mashed).
     estimating: bool,
+    /// Parallel mode: starting a service does not stop the other running
+    /// services of its group (default: exclusive group swap, the VRAM-safe
+    /// behavior). Per-session: a new GUI starts in exclusive mode.
+    parallel: bool,
 }
 
 impl App {
@@ -83,13 +90,19 @@ impl App {
         for (name, svc_cfg) in cfg.services {
             let controller = ServiceController::new(svc_cfg.clone(), None);
             let (state, healthy) = controller.combined_state();
-            let (setup_name, ctx_value, ctx_note) = match run::setup_name_from_unit(&svc_cfg.unit) {
-                Some(setup) => match vram::load_spec_raw(&setup) {
-                    Ok(spec) => (Some(setup), spec.flags.ctx_size, None),
-                    Err(e) => (Some(setup), None, Some(format!("setup file: {e}"))),
-                },
-                None => (None, None, None),
-            };
+            let (setup_name, ctx_value, ctx_note, port) =
+                match run::setup_name_from_unit(&svc_cfg.unit) {
+                    Some(setup) => match vram::load_spec_raw(&setup) {
+                        Ok(spec) => (
+                            Some(setup),
+                            spec.flags.ctx_size,
+                            None,
+                            Some(spec.server.port),
+                        ),
+                        Err(e) => (Some(setup), None, Some(format!("setup file: {e}")), None),
+                    },
+                    None => (None, None, None, None),
+                };
             services.push(ServiceInfo {
                 name,
                 config: svc_cfg,
@@ -101,6 +114,7 @@ impl App {
                 ctx_value,
                 ctx_estimate: None,
                 ctx_note,
+                port,
             });
         }
         let (_tx, estimates_rx) = std::sync::mpsc::channel();
@@ -114,6 +128,7 @@ impl App {
             gpu_free_mib: None,
             estimates_rx,
             estimating: false,
+            parallel: false,
         };
         app.selected_log_service = app.services.first().map(|s| s.name.clone());
         // First estimate runs in the background too: parsing a real model
@@ -280,7 +295,7 @@ impl App {
             // like the CLI's `activate`/`toggle`, so two models in one group
             // never load at once. An already-Active target is a no-op there,
             // so it skips the peer stop (matching `activate`'s no-op rule).
-            let peers = if matches!(target_state, Some(ServiceState::Active)) {
+            let peers = if self.parallel || matches!(target_state, Some(ServiceState::Active)) {
                 Vec::new()
             } else {
                 crate::cli::members_to_stop(&name, &entries)
@@ -329,6 +344,42 @@ impl App {
         svc.state = s;
         svc.healthy = h;
         res
+    }
+
+    /// Services in the same group that a start of `name` would stop first
+    /// (exclusive mode only; parallel mode never auto-stops peers). Uses
+    /// the cached polled state — good enough for the confirm dialog.
+    fn peers_to_stop(&self, name: &str) -> Vec<String> {
+        if self.parallel {
+            return Vec::new();
+        }
+        let mut entries: Vec<(String, String, ServiceState)> = self
+            .services
+            .iter()
+            .map(|s| (s.name.clone(), s.config.group.clone(), s.state.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let target = entries
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, state)| state.clone());
+        if matches!(target, Some(ServiceState::Active)) {
+            return Vec::new();
+        }
+        crate::cli::members_to_stop(name, &entries)
+    }
+
+    /// Display name of an active service already bound to `name`'s port —
+    /// in parallel mode a start there would fail the port pre-flight.
+    fn port_conflict(&self, name: &str) -> Option<String> {
+        let target = self.services.iter().find(|s| s.name == name)?;
+        let port = target.port?;
+        self.services
+            .iter()
+            .find(|s| {
+                s.name != name && s.port == Some(port) && matches!(s.state, ServiceState::Active)
+            })
+            .map(|s| s.config.display_name.clone())
     }
 
     /// Fetch `journalctl` for a unit in a background thread and store the
@@ -421,6 +472,12 @@ impl App {
                 if ui.button("Refresh").clicked() {
                     refresh_now = true;
                 }
+                let parallel_resp = ui.checkbox(&mut self.parallel, "Parallel");
+                parallel_resp.on_hover_text(
+                    "When enabled, starting a service does not stop the other \
+                     running services of its group. Models whose setups share \
+                     a port still cannot run at the same time.",
+                );
                 if let Some(free) = self.gpu_free_mib {
                     ui.label(
                         RichText::new(format!("GPU free {:.1} GiB", free as f64 / 1024.0))
@@ -464,6 +521,29 @@ impl App {
                         "Are you sure you want to {} service '{}'?",
                         verb, name
                     ));
+                    if let ConfirmAction::Start(_) = &action {
+                        if !self.parallel {
+                            let peers = self.peers_to_stop(name);
+                            if !peers.is_empty() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "This will first stop: {}",
+                                        peers.join(", ")
+                                    ))
+                                    .small(),
+                                );
+                            }
+                        } else if let Some(other) = self.port_conflict(name) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Warning: '{}' is already active on the same port — the start will fail until it is stopped.",
+                                    other
+                                ))
+                                .small()
+                                .color(Color32::from_rgb(255, 180, 80)),
+                            );
+                        }
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Yes").clicked() {
                             self.pending_action = Some(action.clone());
@@ -728,6 +808,7 @@ pub fn run_gui() -> Result<(), String> {
                 gpu_free_mib: None,
                 estimates_rx,
                 estimating: false,
+                parallel: false,
             }))
         }),
     )
@@ -737,7 +818,81 @@ pub fn run_gui() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServiceConfig;
     use crate::service::ServiceState;
+
+    fn make_info(name: &str, state: ServiceState, port: Option<u16>) -> ServiceInfo {
+        let config = ServiceConfig {
+            unit: format!("llm-server@{name}.service"),
+            display_name: format!("{name} model"),
+            health_url: "http://127.0.0.1:1/health".into(),
+            group: "default".into(),
+        };
+        ServiceInfo {
+            name: name.into(),
+            controller: ServiceController::new(config.clone(), None),
+            config,
+            state,
+            healthy: false,
+            loading: false,
+            setup_name: Some(name.into()),
+            ctx_value: None,
+            ctx_estimate: None,
+            ctx_note: None,
+            port,
+        }
+    }
+
+    fn test_app(parallel: bool) -> App {
+        let (_tx, estimates_rx) = std::sync::mpsc::channel();
+        App {
+            services: vec![
+                make_info("a", ServiceState::Active, Some(8080)),
+                make_info("b", ServiceState::Inactive, Some(8080)),
+                make_info("c", ServiceState::Inactive, Some(9090)),
+            ],
+            last_poll: Instant::now(),
+            confirm_action: None,
+            pending_action: None,
+            selected_log_service: None,
+            last_error: None,
+            gpu_free_mib: None,
+            estimates_rx,
+            estimating: false,
+            parallel,
+        }
+    }
+
+    #[test]
+    fn test_peers_to_stop_respects_parallel_mode() {
+        // Exclusive (default): starting b stops the active same-group peer a.
+        let app = test_app(false);
+        assert_eq!(app.peers_to_stop("b"), vec!["a"]);
+        // Starting the already-active service is a no-op: no peer stops.
+        assert!(app.peers_to_stop("a").is_empty());
+        // Parallel: peers are never auto-stopped.
+        let app = test_app(true);
+        assert!(app.peers_to_stop("b").is_empty());
+        assert!(app.peers_to_stop("c").is_empty());
+    }
+
+    #[test]
+    fn test_port_conflict_detection() {
+        let app = test_app(true);
+        // b shares port 8080 with active a → conflict.
+        assert_eq!(app.port_conflict("b").as_deref(), Some("a model"));
+        // c uses a different port → no conflict.
+        assert_eq!(app.port_conflict("c").as_deref(), None);
+        // The active service itself never conflicts with itself.
+        assert_eq!(app.port_conflict("a").as_deref(), None);
+    }
+
+    #[test]
+    fn test_port_conflict_requires_known_port() {
+        let mut app = test_app(true);
+        app.services[1].port = None; // no setup file → port unknown
+        assert_eq!(app.port_conflict("b"), None);
+    }
 
     #[test]
     fn test_state_label() {
