@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, Context, RichText, Ui};
 use once_cell::sync::Lazy;
 
-use crate::config::{load_config, ServiceConfig};
+use crate::config::{ServiceConfig, load_config};
 use crate::lock::ProcessLock;
 use crate::run;
 use crate::service::{ServiceController, ServiceState};
@@ -113,7 +113,6 @@ impl App {
     }
 
     fn poll(&mut self) {
-        let mut changed = false;
         for svc in &mut self.services {
             let prev_state = svc.state.clone();
             let (s, h) = svc.controller.combined_state();
@@ -121,17 +120,18 @@ impl App {
             svc.healthy = h;
 
             if prev_state != svc.state {
-                changed = true;
                 let title = "Service state changed";
                 let body = format!("{} is now {:?}", svc.config.display_name, svc.state);
                 svc.controller.notify(title, &body);
             }
         }
-        // VRAM changed under us: refresh the context estimates (one
-        // nvidia-smi call + GGUF header reads, only on transitions).
-        if changed {
-            self.recompute_estimates();
-        }
+        // Always recompute the context estimates, not just on state
+        // changes: free VRAM moves without a state transition (a stopped
+        // model releases its VRAM a few seconds *after* the state flips
+        // to Inactive, other GPU processes come and go), and the slider
+        // max + "GPU free" readout must track that. One nvidia-smi call
+        // plus small GGUF header reads per poll.
+        self.recompute_estimates();
         self.last_poll = Instant::now();
     }
 
@@ -339,9 +339,15 @@ impl App {
             .resizable(true)
             .show(ctx, |ui| self.log_panel(ui));
 
+        let mut refresh_now = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("LLM Server Indicator");
+                // Manual refresh: immediately re-poll service state +
+                // free VRAM instead of waiting for the 2 s auto-poll.
+                if ui.button("Refresh").clicked() {
+                    refresh_now = true;
+                }
                 if let Some(free) = self.gpu_free_mib {
                     ui.label(
                         RichText::new(format!("GPU free {:.1} GiB", free as f64 / 1024.0))
@@ -366,6 +372,9 @@ impl App {
                 }
             });
         });
+        if refresh_now {
+            self.poll();
+        }
 
         // Confirm dialog
         if let Some(action) = self.confirm_action.clone() {

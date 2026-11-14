@@ -85,7 +85,7 @@ llm-server-ctl status --service qwen --json  # single-service JSON
   max_ctx = (free_VRAM − 1 GiB safety − weights_on_GPU) ÷ KV_bytes_per_token
   ```
 
-  `KV_bytes_per_token` comes from the model's GGUF metadata (full-attention layer count × KV heads × head size × `cache_type_k`/`v`), so hybrid models where only some layers keep a KV cache are estimated correctly. If `nvidia-smi` or the GGUF can't be read, the slider falls back to a generic `6400…131072` range with a note. The slider is **locked while the service is running** (the value only takes effect on the next start); the estimate refreshes automatically whenever a service changes state.
+  `KV_bytes_per_token` comes from the model's GGUF metadata (full-attention layer count × KV heads × head size × `cache_type_k`/`v`), so hybrid models where only some layers keep a KV cache are estimated correctly. If `nvidia-smi` or the GGUF can't be read, the slider falls back to a generic `6400…131072` range with a note. The slider is **locked while the service is running** (the value only takes effect on the next start). Service state, the "GPU free" readout, and the slider estimate refresh automatically every 2 s — a stopped model frees its VRAM a few seconds after the state change, so the max keeps tracking it; the **Refresh** button in the header forces an immediate refresh.
 - **Log panel** — resizable bottom panel inside the window (not a popout): pick a service, `Refresh`, and a monospace view of the last 200 `journalctl` lines, auto-scrolled to the newest line.
 
 ## Configuration
